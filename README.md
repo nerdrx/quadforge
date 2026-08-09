@@ -39,7 +39,8 @@ materials, vertex weights and shape keys along** to the new topology.
 
 ## Install
 
-1. Zip the `quadforge/` folder (or use `./package.sh` → `quadforge-<version>.zip`)
+1. Download the zip from the [latest release](https://github.com/nerdrx/quadforge/releases/latest)
+   (or build it yourself with `./package.sh`)
 2. Blender → Edit → Preferences → Add-ons → Install from Disk → pick the zip
 3. Panel appears in the 3D Viewport sidebar (N) → **QuadForge** tab
 
