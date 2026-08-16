@@ -379,9 +379,13 @@ def _run_worker_round(part_objs, per_part_kwargs, timeout: float):
             "out": out_blend,
             "objects": {p.name: per_part_kwargs[p.name] for p in part_objs},
         }
+        # params go via file: hundreds of parts overflow ARG_MAX as an argument
+        params_path = os.path.join(td, "params.json")
+        with open(params_path, "w") as fh:
+            json.dump(params, fh)
         cmd = [
             bpy.app.binary_path, "--background", "--factory-startup", in_blend,
-            "--python", worker, "--", json.dumps(params),
+            "--python", worker, "--", params_path,
         ]
         stdout = ""
         timed_out = False
@@ -478,6 +482,13 @@ def _solve(context, work_obj, s, stats, **params):
             # below ~24 faces QuadriFlow cancels instead of solving
             k["target_faces"] = int(max(24, round(total_target * areas[p.name] / total_area)))
             per_part[p.name] = k
+        floor_sum = sum(k["target_faces"] for k in per_part.values())
+        if floor_sum > 1.3 * total_target:
+            stats["floor_overshoot"] = floor_sum
+            stats.setdefault("warnings", []).append(
+                "target %d is below what %d separate shells can express; "
+                "expect roughly %d+ faces" % (total_target, len(parts), floor_sum)
+            )
 
         # (mesh rescale, target jitter, seed jitter) — each retry round changes
         # the solver's discretization completely, the most reliable stall escape
@@ -514,10 +525,17 @@ def _solve(context, work_obj, s, stats, **params):
                 if isinstance(exc, BackendError):
                     raise
                 # isolation infrastructure failed (no binary, sandbox, ...):
-                # solve in-process rather than not at all
+                # solve in-process rather than not at all, keeping originals
+                # for parts the operator refuses
                 stats["isolation_fallback"] = str(exc)[:120]
+                kept = 0
                 for p in remaining:
-                    _run_op(context, p, **params)
+                    try:
+                        _run_op(context, p, **params)
+                    except Exception:
+                        kept += 1
+                if kept:
+                    stats["unsolvable_parts"] = stats.get("unsolvable_parts", 0) + kept
                 remaining = []
                 break
             if rescale != 1.0:

@@ -371,10 +371,16 @@ def capture(obj, use_evaluated=True):
 # surface mapping
 # ---------------------------------------------------------------------------
 
-def _nearest_tris(snap, points):
+def _nearest_tris(snap, points, normals=None):
     """Nearest-surface query.  points (n,3) -> (tri_idx (n,) i4, loc (n,3) f8).
 
     tri_idx is -1 where nothing was hit.
+
+    When ``normals`` (n,3) is given the query is side-aware: on thin shells
+    (limbs, ears, cards) the plain nearest hit is frequently the *opposite*
+    wall, which silently transfers the wrong weights/deltas. A hit whose face
+    normal opposes the query normal is re-tried from a point nudged outward
+    along the query normal, keeping the better-facing hit.
     """
     n = points.shape[0]
     tri_idx = np.full(n, -1, 'i4')
@@ -387,9 +393,28 @@ def _nearest_tris(snap, points):
     lo = loc
     for i, p in enumerate(points.tolist()):
         r = fn(p)
-        if r is not None and r[2] is not None:
-            ti[i] = r[2]
-            lo[i] = r[0]
+        if r is None or r[2] is None:
+            continue
+        ti[i] = r[2]
+        lo[i] = r[0]
+        if normals is None:
+            continue
+        nq = normals[i]
+        if r[1].dot((float(nq[0]), float(nq[1]), float(nq[2]))) >= 0.0:
+            continue
+        d0 = float(r[3]) if r[3] is not None else 0.0
+        base = np.asarray(p)
+        for off in (2.5 * d0 + 1e-6, 6.0 * d0 + 1e-6):
+            probe = base + nq * off
+            r2 = fn((float(probe[0]), float(probe[1]), float(probe[2])))
+            if r2 is None or r2[2] is None:
+                continue
+            hit = np.asarray(r2[0])
+            if (r2[1].dot((float(nq[0]), float(nq[1]), float(nq[2]))) >= 0.0
+                    and np.linalg.norm(hit - base) <= 4.0 * off):
+                ti[i] = r2[2]
+                lo[i] = hit
+                break
     return tri_idx, loc
 
 
@@ -546,17 +571,68 @@ def apply(snapshot, new_obj, s=None):
         return rep
 
     NV = _fget(me.vertices, "co", nv * 3, 'f8').reshape(-1, 3)
+    try:
+        VN = _fget(me.vertex_normals, "vector", nv * 3, 'f8').reshape(-1, 3)
+    except Exception:
+        VN = None
 
-    # ---- per-vertex mapping -------------------------------------------
-    v_tri, v_loc = _nearest_tris(snapshot, NV)
+    # ---- per-vertex mapping (side-aware on thin shells) ----------------
+    v_tri, v_loc = _nearest_tris(snapshot, NV, normals=VN)
     rep['unmapped'] = int((v_tri < 0).sum())
     # Barycentric coords of the *vertex itself* projected onto its triangle
     # (not of the projected point) so interpolation follows the vertex, and is
     # exact for vertices that lie on the source surface.
     v_bary = _bary(snapshot, v_tri, NV)
 
+    # Vertex-identity override: geometry kept verbatim (shells the solver
+    # refused, grafted regions) must take its own source vertex's data.
+    # Nearest-surface is ambiguous inside stacked/interpenetrating card shells
+    # (fur, feathers) — a coincident stack-mate's triangle wins arbitrarily and
+    # its different weights make the card fly off when posed. An exact position
+    # match is rewritten as a one-hot barycentric on the matched source vertex,
+    # which every downstream interpolation then honours automatically.
+    try:
+        from mathutils.kdtree import KDTree
+        S = snapshot.verts
+        bb = S.max(0) - S.min(0)
+        eps = 1e-5 * float(np.linalg.norm(bb))
+        kt = KDTree(len(S))
+        ins = kt.insert
+        for j, c in enumerate(S.tolist()):
+            ins(c, j)
+        kt.balance()
+        T = snapshot.tris
+        v2tri = np.full(len(S), -1, 'i8')
+        v2corner = np.zeros(len(S), 'i8')
+        tidx = np.arange(len(T))
+        for corner in range(3):
+            v2tri[T[:, corner]] = tidx
+            v2corner[T[:, corner]] = corner
+        exact = 0
+        find = kt.find
+        for i, p in enumerate(NV.tolist()):
+            _c, j, d = find(p)
+            if j is None or d is None or d > eps:
+                continue
+            t = int(v2tri[j])
+            if t < 0:
+                continue
+            v_tri[i] = t
+            v_bary[i] = 0.0
+            v_bary[i, int(v2corner[j])] = 1.0
+            exact += 1
+        rep['exact_vertex_matches'] = exact
+    except Exception as exc:
+        rep['warnings'].append(f"vertex-identity pass failed: {exc}")
+
     # ---- vertex groups -------------------------------------------------
     if _flag('preserve_weights') and snapshot.vgroups:
+        # The work mesh can arrive with stale groups (carried through the
+        # solver / duplicated un-swapped by the exact-symmetry mirror, e.g.
+        # right-hand weights on the mirrored left hand). Transferred weights
+        # are authoritative — start from a clean slate.
+        for g in list(new_obj.vertex_groups):
+            new_obj.vertex_groups.remove(g)
         for g in snapshot.vgroups:
             w = _interp_vert(snapshot, v_tri, v_bary, g['weights'])
             np.clip(w, 0.0, 1.0, out=w)

@@ -19,7 +19,12 @@ import bpy
 
 def main():
     argv = sys.argv
-    params = json.loads(argv[argv.index("--") + 1])
+    arg = argv[argv.index("--") + 1]
+    if arg.lstrip().startswith("{"):
+        params = json.loads(arg)
+    else:
+        with open(arg) as fh:
+            params = json.load(fh)
     out_path = params["out"]
     jobs = params["objects"]
 

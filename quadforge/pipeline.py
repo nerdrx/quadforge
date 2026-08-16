@@ -372,6 +372,98 @@ def mirror_weld(work_obj, axes, snap_tol: float, weld_eps: float = 1e-7) -> int:
     return leftover
 
 
+def restore_lost_regions(work_obj, pre_mesh, report) -> int:
+    """Graft back input regions the solver silently dropped.
+
+    Blender's QuadriFlow discards interior cavities (mouth bags, nested shells)
+    when the mesh has open boundaries — e.g. on the bisected half used for
+    exact symmetry. Any connected input region whose faces are all far from the
+    solved surface is copied back verbatim (original topology) and reported.
+    Returns the number of restored faces."""
+    if not len(pre_mesh.polygons) or not len(work_obj.data.polygons):
+        return 0
+
+    solved = work_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(solved)
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+    verts = [tuple(v.co) for v in bm.verts]
+    tris = [[v.index for v in f.verts] for f in bm.faces]
+    bm.free()
+    if not tris:
+        return 0
+    try:
+        bvh = BVHTree.FromPolygons(verts, tris, all_triangles=True)
+    except Exception:
+        return 0
+
+    n = len(pre_mesh.polygons)
+    centers = np.empty(n * 3)
+    pre_mesh.polygons.foreach_get("center", centers)
+    centers = centers.reshape(-1, 3)
+    co = np.empty(len(pre_mesh.vertices) * 3)
+    pre_mesh.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    diag = float(np.linalg.norm(co.max(0) - co.min(0))) or 1.0
+
+    dist = np.empty(n)
+    for i in range(n):
+        hit = bvh.find_nearest(Vector(centers[i]))
+        dist[i] = hit[3] if hit[0] is not None else 0.0
+    far = dist > 0.02 * diag
+    if not far.any():
+        return 0
+
+    # connected components over far faces (vertex adjacency)
+    pre_bm = bmesh.new()
+    pre_bm.from_mesh(pre_mesh)
+    pre_bm.faces.ensure_lookup_table()
+    seen = set()
+    lost = set()
+    for fi in np.nonzero(far)[0]:
+        if int(fi) in seen:
+            continue
+        comp = []
+        stack = [pre_bm.faces[int(fi)]]
+        seen.add(int(fi))
+        while stack:
+            f = stack.pop()
+            comp.append(f.index)
+            for e in f.edges:
+                for nf in e.link_faces:
+                    if nf.index not in seen and far[nf.index]:
+                        seen.add(nf.index)
+                        stack.append(nf)
+        if len(comp) >= 16 and float(dist[comp].mean()) > 0.04 * diag:
+            lost.update(comp)
+    if not lost:
+        pre_bm.free()
+        return 0
+
+    doomed = [f for f in pre_bm.faces if f.index not in lost]
+    bmesh.ops.delete(pre_bm, geom=doomed, context='FACES')
+    graft = bpy.data.meshes.new(pre_mesh.name + "_graft")
+    pre_bm.to_mesh(graft)
+    pre_bm.free()
+
+    out = bmesh.new()
+    out.from_mesh(solved)
+    out.from_mesh(graft)
+    out.to_mesh(solved)
+    out.free()
+    solved.update()
+    try:
+        bpy.data.meshes.remove(graft)
+    except Exception:
+        pass
+    report.setdefault("warnings", []).append(
+        "solver dropped %d faces of interior/nested geometry; original topology "
+        "was restored for those regions" % len(lost)
+    )
+    report["restored_faces"] = len(lost)
+    return len(lost)
+
+
 def fix_orientation(work_obj, ref_mesh) -> int:
     """Flip whole shells whose normals disagree with the nearest source
     surface. recalc_face_normals' outward heuristic is unreliable on open or
@@ -502,9 +594,11 @@ def _adaptive_boost(s) -> float:
 
 
 def _call_backend(context, backend, work_obj, s, target, *, force_boundary=False,
-                  symmetry=None):
+                  symmetry=None, report=None):
     """Call ``backend.remesh``, passing the extra QuadForge hints only if the
-    backend accepts them (the contract signature is the 4-argument one)."""
+    backend accepts them (the contract signature is the 4-argument one).
+    When ``report`` is given, input regions the solver silently dropped are
+    grafted back afterwards (see restore_lost_regions)."""
     kwargs = {}
     try:
         import inspect
@@ -515,7 +609,23 @@ def _call_backend(context, backend, work_obj, s, target, *, force_boundary=False
             kwargs["symmetry"] = symmetry
     except (TypeError, ValueError):
         kwargs = {}
-    return backend.remesh(context, work_obj, s, int(target), **kwargs)
+    pre = work_obj.data.copy() if report is not None else None
+    try:
+        stats = backend.remesh(context, work_obj, s, int(target), **kwargs)
+        if pre is not None:
+            try:
+                restore_lost_regions(work_obj, pre, report)
+            except Exception as exc:
+                report.setdefault("warnings", []).append(
+                    f"lost-region check failed: {exc}"
+                )
+        return stats
+    finally:
+        if pre is not None:
+            try:
+                bpy.data.meshes.remove(pre)
+            except Exception:
+                pass
 
 
 def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
@@ -540,7 +650,7 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
 
     if not exact:
         report["symmetry_mode"] = "solver" if axes else "none"
-        stats = _call_backend(context, backend, work_obj, s, requested)
+        stats = _call_backend(context, backend, work_obj, s, requested, report=report)
         report["backend_stats"] = stats if isinstance(stats, dict) else {}
         if post_pass is not None:
             post_pass(work_obj, face_target)
@@ -562,7 +672,7 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
             "exact symmetry: bisecting left no geometry, falling back to solver symmetry"
         )
         report["symmetry_mode"] = "solver"
-        stats = _call_backend(context, backend, work_obj, s, requested)
+        stats = _call_backend(context, backend, work_obj, s, requested, report=report)
         report["backend_stats"] = stats if isinstance(stats, dict) else {}
         if post_pass is not None:
             post_pass(work_obj, face_target)
@@ -573,7 +683,7 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
     report["half_target"] = half_target
     stats = _call_backend(
         context, backend, work_obj, s, half_target,
-        force_boundary=True, symmetry=(False, False, False),
+        force_boundary=True, symmetry=(False, False, False), report=report,
     )
     report["backend_stats"] = stats if isinstance(stats, dict) else {}
 
@@ -725,6 +835,8 @@ def run_remesh(context, obj, s) -> dict:
                 raise RuntimeError("the solver returned an empty mesh")
 
             bstats = report.get("backend_stats") or {}
+            for w in bstats.get("warnings") or []:
+                report["warnings"].append(w)
             if bstats.get("unsolvable_parts"):
                 report["warnings"].append(
                     "%d degenerate shell(s) (%d faces) refused by the solver; "
