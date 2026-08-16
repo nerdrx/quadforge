@@ -171,6 +171,19 @@ def preclean(work_obj, merge_eps: float = MERGE_EPS) -> dict:
             _delete_loose(bm)
     stats["pinched_verts_split"] = split
 
+    # T-junction edges (3+ faces on one edge, common where game-mesh card fans
+    # share a spine) are repairable too: splitting detaches the fans into
+    # separately-welded sheets without moving any geometry.
+    bad_edges = [e for e in bm.edges if len(e.link_faces) > 2]
+    if bad_edges:
+        stats["overshared_edges_split"] = len(bad_edges)
+        bmesh.ops.split_edges(bm, edges=bad_edges)
+        _delete_loose(bm)
+        split2 = _split_pinched_verts(bm)
+        if split2:
+            _delete_loose(bm)
+            stats["pinched_verts_split"] = stats.get("pinched_verts_split", 0) + split2
+
     bad_edges = [e for e in bm.edges if len(e.link_faces) > 2]
     boundary = [e for e in bm.edges if len(e.link_faces) == 1]
     stats["boundary_edges"] = len(boundary)

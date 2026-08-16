@@ -788,7 +788,28 @@ def run_remesh(context, obj, s) -> dict:
         if getattr(s, "backend", "QUADRIFLOW") == "NATIVE" and backend_name != "NATIVE":
             report["warnings"].append("native backend unavailable, used QuadriFlow")
 
-        work = make_work_object(context, obj)
+        # Remesh the REST shape: non-zero shape-key sliders would bake the
+        # deformed surface as the new Basis and then re-apply the key deltas on
+        # top (double deformation). Snapshot already stored the slider values;
+        # zero them for the evaluated copy and restore right after.
+        _key_restore = []
+        try:
+            for kb in (obj.data.shape_keys.key_blocks
+                       if obj.data.shape_keys else ()):
+                if kb.value != 0.0:
+                    _key_restore.append((kb, kb.value))
+                    kb.value = 0.0
+        except Exception:
+            _key_restore = []
+
+        try:
+            work = make_work_object(context, obj)
+        finally:
+            for kb, val in _key_restore:
+                try:
+                    kb.value = val
+                except Exception:
+                    pass
         face_target = face_target_from_settings(obj, work.data, s)
         report["target_faces"] = face_target
         report["mode"] = getattr(s, "mode", "FACES")
