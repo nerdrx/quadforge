@@ -11,6 +11,8 @@ Thin, robust wrapper around ``bpy.ops.object.quadriflow_remesh`` that
 
 from __future__ import annotations
 
+import json
+
 import bmesh
 import bpy
 import numpy as np
@@ -250,8 +252,23 @@ def _override(context, work_obj):
     return ov
 
 
-def _run_op(context, work_obj, *, symmetry_on, preserve_sharp, preserve_boundary,
-            preserve_attributes, smooth_normals, target_faces, seed, mesh_area=-1.0):
+def _op_kwargs(*, symmetry_on, preserve_sharp, preserve_boundary,
+               preserve_attributes, smooth_normals, target_faces, seed,
+               mesh_area=-1.0):
+    return dict(
+        use_mesh_symmetry=bool(symmetry_on),
+        use_preserve_sharp=bool(preserve_sharp),
+        use_preserve_boundary=bool(preserve_boundary),
+        preserve_attributes=bool(preserve_attributes),
+        smooth_normals=bool(smooth_normals),
+        mode="FACES",
+        target_faces=int(max(4, target_faces)),
+        mesh_area=float(mesh_area),
+        seed=int(seed),
+    )
+
+
+def _run_op(context, work_obj, **params):
     view_layer = getattr(context, "view_layer", None)
     if view_layer is not None:
         try:
@@ -263,17 +280,7 @@ def _run_op(context, work_obj, *, symmetry_on, preserve_sharp, preserve_boundary
     except Exception:
         pass
 
-    kwargs = dict(
-        use_mesh_symmetry=bool(symmetry_on),
-        use_preserve_sharp=bool(preserve_sharp),
-        use_preserve_boundary=bool(preserve_boundary),
-        preserve_attributes=bool(preserve_attributes),
-        smooth_normals=bool(smooth_normals),
-        mode="FACES",
-        target_faces=int(max(4, target_faces)),
-        mesh_area=float(mesh_area),
-        seed=int(seed),
-    )
+    kwargs = _op_kwargs(**params)
     with context.temp_override(**_override(context, work_obj)):
         res = bpy.ops.object.quadriflow_remesh(**kwargs)
     if "CANCELLED" in res:
@@ -281,6 +288,292 @@ def _run_op(context, work_obj, *, symmetry_on, preserve_sharp, preserve_boundary
             "QuadriFlow cancelled - the input is most likely non-manifold or "
             "too degenerate for the solver"
         )
+
+
+def _separate_loose(context, work_obj):
+    """Split work_obj into loose parts. Returns the list of part objects
+    (work_obj itself is one of them)."""
+    for o in context.view_layer.objects:
+        try:
+            o.select_set(False)
+        except Exception:
+            pass
+    work_obj.select_set(True)
+    context.view_layer.objects.active = work_obj
+    before = set(bpy.data.objects)
+    with context.temp_override(
+        object=work_obj,
+        active_object=work_obj,
+        selected_objects=[work_obj],
+        selected_editable_objects=[work_obj],
+    ):
+        bpy.ops.mesh.separate(type='LOOSE')
+    parts = [work_obj] + [o for o in bpy.data.objects if o not in before]
+    return parts
+
+
+def _join_parts(context, work_obj, parts):
+    """Join the part objects back into work_obj."""
+    others = [p for p in parts if p is not work_obj]
+    if not others:
+        return
+    for o in context.view_layer.objects:
+        try:
+            o.select_set(False)
+        except Exception:
+            pass
+    for p in parts:
+        p.select_set(True)
+    context.view_layer.objects.active = work_obj
+    with context.temp_override(
+        object=work_obj,
+        active_object=work_obj,
+        selected_objects=list(parts),
+        selected_editable_objects=list(parts),
+    ):
+        bpy.ops.object.join()
+
+
+def _mesh_area(mesh) -> float:
+    n = len(mesh.polygons)
+    if not n:
+        return 0.0
+    areas = np.empty(n, dtype=np.float64)
+    mesh.polygons.foreach_get("area", areas)
+    return float(areas.sum())
+
+
+def _fuse_stray_tris(mesh) -> int:
+    """QuadriFlow emits a few triangles on small shells; fuse adjacent pairs
+    into quads. Returns the number of triangles remaining."""
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    tris = [f for f in bm.faces if len(f.verts) == 3]
+    if tris:
+        bmesh.ops.join_triangles(
+            bm, faces=tris,
+            angle_face_threshold=3.15, angle_shape_threshold=3.15,
+        )
+        bm.to_mesh(mesh)
+        mesh.update()
+    left = sum(1 for f in bm.faces if len(f.verts) == 3)
+    bm.free()
+    return left
+
+
+def _run_worker_round(part_objs, per_part_kwargs, timeout: float):
+    """One child-Blender round over the given parts. Replaces the mesh of every
+    part the worker finished (even when a later part stalled). Returns the list
+    of parts that remain unsolved, or raises BackendError on infrastructure
+    failure."""
+    import os
+    import subprocess
+    import tempfile
+
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qf_worker.py")
+    with tempfile.TemporaryDirectory(prefix="quadforge_") as td:
+        in_blend = os.path.join(td, "in.blend")
+        out_blend = os.path.join(td, "out.blend")
+        bpy.data.libraries.write(in_blend, set(part_objs), fake_user=False)
+        params = {
+            "out": out_blend,
+            "objects": {p.name: per_part_kwargs[p.name] for p in part_objs},
+        }
+        cmd = [
+            bpy.app.binary_path, "--background", "--factory-startup", in_blend,
+            "--python", worker, "--", json.dumps(params),
+        ]
+        stdout = ""
+        timed_out = False
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            stdout = proc.stdout or ""
+            if proc.returncode != 0 and "QF_WORKER_FINISHED" not in stdout:
+                tail = (stdout + (proc.stderr or "")).strip()[-300:]
+                raise BackendError(f"QuadriFlow worker failed: {tail}")
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            out = exc.stdout
+            stdout = out.decode(errors="replace") if isinstance(out, bytes) else (out or "")
+
+        done = {}  # part object name -> solved mesh datablock name
+        failed = set()  # parts the op deterministically refused this round
+        for line in stdout.splitlines():
+            if line.startswith("QF_PART_DONE"):
+                fields = line.split()
+                if len(fields) >= 3:
+                    done[fields[1]] = fields[2]
+            elif line.startswith("QF_PART_FAILED"):
+                fields = line.split()
+                if len(fields) >= 2:
+                    failed.add(fields[1])
+        if done and os.path.exists(out_blend):
+            wanted = [done[p.name] for p in part_objs if p.name in done]
+            with bpy.data.libraries.load(out_blend) as (src, dst):
+                avail = set(src.meshes)
+                request = [m for m in wanted if m in avail]
+                request_names = list(request)  # load mutates the assigned list
+                dst.meshes = request
+            # dst.meshes preserves request order even when clashes rename them
+            solved = {
+                name: mesh for name, mesh in zip(request_names, dst.meshes)
+                if mesh is not None
+            }
+            for part in part_objs:
+                mesh_name = done.get(part.name)
+                if mesh_name is None:
+                    continue
+                new_mesh = solved.get(mesh_name)
+                if new_mesh is None:
+                    done.pop(part.name, None)
+                    continue
+                old = part.data
+                keep_name = old.name
+                part.data = new_mesh
+                try:
+                    bpy.data.meshes.remove(old)
+                except Exception:
+                    pass
+                new_mesh.name = keep_name
+                _fuse_stray_tris(new_mesh)
+
+    return [p for p in part_objs if p.name not in done], failed
+
+
+def _solve(context, work_obj, s, stats, **params):
+    """One logical QuadriFlow solve.
+
+    Isolation mode (default): the mesh is split into loose parts, each part is
+    remeshed with an area-proportional face budget in a killable child Blender
+    process, and the parts are joined back. A part whose solve stalls (rare
+    upstream QuadriFlow non-convergence, chaotically input-dependent) is
+    retried with rescale/target/seed jitter; after all retries only that part
+    is left unremeshed and reported, instead of the whole mesh failing — and a
+    stall can never freeze the session.
+    """
+    if not bool(getattr(s, "solver_isolation", True)):
+        _run_op(context, work_obj, **params)
+        return
+
+    kwargs = _op_kwargs(**params)
+    total_target = int(kwargs["target_faces"])
+
+    parts = _separate_loose(context, work_obj)
+    # per-part autoscale: a tiny shell (whiskers, claws) can sit far below
+    # QuadriFlow's absolute edge epsilon even after the global autoscale
+    base_scale = {}
+    for p in parts:
+        f = _autoscale_factor(p.data)
+        if f != 1.0:
+            _scale_mesh(p.data, f)
+        base_scale[p.name] = f
+    big_part = max(parts, key=lambda p: len(p.data.polygons))
+    big_backup = big_part.data.copy() if len(parts) > 1 else None
+    try:
+        areas = {p.name: _mesh_area(p.data) for p in parts}
+        total_area = sum(areas.values()) or 1.0
+        per_part = {}
+        for p in parts:
+            k = dict(kwargs)
+            # below ~24 faces QuadriFlow cancels instead of solving
+            k["target_faces"] = int(max(24, round(total_target * areas[p.name] / total_area)))
+            per_part[p.name] = k
+
+        # (mesh rescale, target jitter, seed jitter) — each retry round changes
+        # the solver's discretization completely, the most reliable stall escape
+        plans = ((1.0, 1.0, 0), (1.31, 1.09, 977), (0.77, 0.93, 3251), (1.73, 1.17, 7919))
+        remaining = list(parts)
+        fail_counts = {}
+        gave_up = []
+        for round_i, (rescale, t_jitter, s_jitter) in enumerate(plans):
+            if not remaining:
+                break
+            n_faces = sum(len(p.data.polygons) for p in remaining)
+            timeout = 60.0 + n_faces / 1000.0 + 0.3 * len(remaining)
+            round_kwargs = {}
+            scaled = list(remaining)
+            for p in scaled:
+                k = dict(per_part[p.name])
+                k["target_faces"] = int(round(k["target_faces"] * t_jitter)) + (1 if round_i else 0)
+                k["seed"] = int(k["seed"]) + s_jitter
+                round_kwargs[p.name] = k
+                if rescale != 1.0:
+                    _scale_mesh(p.data, rescale)
+            try:
+                remaining, failed = _run_worker_round(scaled, round_kwargs, timeout)
+                for name in failed:
+                    fail_counts[name] = fail_counts.get(name, 0) + 1
+                # a part the op refuses twice is degenerate for QuadriFlow —
+                # keep its original geometry instead of burning more rounds
+                gave_up.extend(p for p in remaining if fail_counts.get(p.name, 0) >= 2)
+                remaining = [p for p in remaining if fail_counts.get(p.name, 0) < 2]
+            except Exception as exc:
+                if rescale != 1.0:
+                    for p in scaled:
+                        _scale_mesh(p.data, 1.0 / rescale)
+                if isinstance(exc, BackendError):
+                    raise
+                # isolation infrastructure failed (no binary, sandbox, ...):
+                # solve in-process rather than not at all
+                stats["isolation_fallback"] = str(exc)[:120]
+                for p in remaining:
+                    _run_op(context, p, **params)
+                remaining = []
+                break
+            if rescale != 1.0:
+                # both solved (mesh swapped, still at worker scale) and
+                # unsolved parts of this round need unscaling
+                for p in scaled:
+                    _scale_mesh(p.data, 1.0 / rescale)
+            if round_i and not remaining:
+                stats["stall_retries"] = round_i
+
+        if gave_up:
+            stats["unsolvable_parts"] = len(gave_up)
+            stats["unsolvable_part_faces"] = sum(len(p.data.polygons) for p in gave_up)
+        if remaining:
+            stats["stalled_parts"] = len(remaining)
+            stats["stalled_part_faces"] = sum(len(p.data.polygons) for p in remaining)
+
+        # Tiny shells can't go below QuadriFlow's per-part floor, so many-part
+        # meshes overshoot the total; compensate by re-solving the biggest part
+        # (from its original geometry) with the excess subtracted.
+        if not remaining and big_backup is not None:
+            actual = sum(len(p.data.polygons) for p in parts)
+            excess = actual - total_target
+            rebal_target = per_part[big_part.name]["target_faces"] - excess
+            if excess > max(0.08 * total_target, 40) and rebal_target >= 50:
+                solved_mesh = big_part.data
+                big_part.data = big_backup
+                big_backup = None
+                k = dict(per_part[big_part.name])
+                k["target_faces"] = int(rebal_target)
+                timeout = 60.0 + len(big_part.data.polygons) / 1000.0
+                left, _ = _run_worker_round([big_part], {big_part.name: k}, timeout)
+                if left:
+                    orig = big_part.data
+                    big_part.data = solved_mesh  # keep the first solve
+                    try:
+                        bpy.data.meshes.remove(orig)
+                    except Exception:
+                        pass
+                else:
+                    stats["rebalanced"] = int(rebal_target)
+                    try:
+                        bpy.data.meshes.remove(solved_mesh)
+                    except Exception:
+                        pass
+    finally:
+        if big_backup is not None:
+            try:
+                bpy.data.meshes.remove(big_backup)
+            except Exception:
+                pass
+        for p in parts:
+            f = base_scale.get(p.name, 1.0)
+            if f != 1.0:
+                _scale_mesh(p.data, 1.0 / f)
+        _join_parts(context, work_obj, parts)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +619,26 @@ def remesh(context, work_obj, s, face_target: int,
     seed = int(getattr(s, "seed", 0))
     strict = bool(getattr(s, "strict_count", False))
 
+    # QuadriFlow needs resolution headroom: when the target approaches the
+    # input triangle count its refine/collapse cycle can stall forever.
+    # Midpoint-subdivide (surface preserving) until the target is well below
+    # the input density.
+    subdiv_rounds = 0
+    while subdiv_rounds < 2:
+        tris = sum(max(0, len(p.vertices) - 2) for p in mesh.polygons)
+        if face_target <= 0.4 * tris or tris > 400000:
+            break
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bmesh.ops.subdivide_edges(bm, edges=bm.edges[:], cuts=1,
+                                  use_grid_fill=True, smooth=0.0)
+        bm.to_mesh(mesh)
+        bm.free()
+        mesh.update()
+        subdiv_rounds += 1
+    if subdiv_rounds:
+        stats["headroom_subdiv"] = subdiv_rounds
+
     autoscale = _autoscale_factor(mesh)
     if autoscale != 1.0:
         _scale_mesh(mesh, autoscale)
@@ -342,12 +655,14 @@ def remesh(context, work_obj, s, face_target: int,
     try:
         for attempt in range(STRICT_MAX_RETRIES + 1):
             if attempt > 0 and backup is not None:
+                # the isolated solver may have swapped the mesh datablock
+                mesh = work_obj.data
                 backup.to_mesh(mesh)
                 mesh.update()
                 _apply_symmetry_flags(mesh, symmetry)
             stats["attempts"] = attempt + 1
-            _run_op(
-                context, work_obj,
+            _solve(
+                context, work_obj, s, stats,
                 symmetry_on=symmetry_on,
                 preserve_sharp=preserve_sharp,
                 preserve_boundary=preserve_boundary,

@@ -14,6 +14,9 @@ materials, vertex weights and shape keys along** to the new topology.
 - **Painted density** — paint where you want more/less resolution (`qf_density` attribute)
 - Backends: **QuadriFlow+** (Blender's built-in solver wrapped with QuadForge pre/post passes)
   and an experimental **Native** field-based solver (Instant-Meshes-style, pure numpy)
+- **Hang-safe solving**: each loose part is solved in an isolated, killable worker process
+  with an area-proportional budget — a stalled or degenerate shell can never freeze Blender
+  or fail the whole mesh (works around a rare upstream QuadriFlow non-convergence bug)
 
 **Edge flow control**
 - Hard-edge detection by angle, plus existing sharp / crease / seam edges

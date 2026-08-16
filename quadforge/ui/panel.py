@@ -161,6 +161,7 @@ class VIEW3D_PT_quadforge(bpy.types.Panel):
         col.prop(s, "keep_original")
         col.prop(s, "backend")
         col.prop(s, "seed")
+        col.prop(s, "solver_isolation")
 
         col.separator()
         col.prop(s, "lod_targets", text="LODs")

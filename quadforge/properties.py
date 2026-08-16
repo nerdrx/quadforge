@@ -111,6 +111,14 @@ class QF_Settings(bpy.types.PropertyGroup):
         default='QUADRIFLOW',
     )
     seed: IntProperty(name="Seed", default=0, min=0)
+    solver_isolation: BoolProperty(
+        name="Hang-Safe Solver",
+        description="Run QuadriFlow in a separate Blender process with a timeout "
+                    "and retry with an adjusted target if it stalls (works around "
+                    "a rare upstream QuadriFlow non-convergence bug). Costs ~1s "
+                    "of process startup per solve",
+        default=True,
+    )
     lod_targets: StringProperty(
         name="LOD Targets",
         description="Comma-separated face counts, e.g. 8000,2000,500",

@@ -17,6 +17,7 @@ import numpy as np
 import bmesh
 import bpy
 from mathutils import Matrix, Vector
+from mathutils.bvhtree import BVHTree
 
 from .core import analysis, guides
 
@@ -198,6 +199,20 @@ def bisect_to_half(work_obj, axes, eps: float) -> bool:
         for v in bm.verts:
             if abs(v.co[ax]) <= eps:
                 v.co[ax] = 0.0
+        # The cut leaves sliver edges/faces where the plane grazed the input;
+        # QuadriFlow can spin (near-)forever on those. Collapse cut edges much
+        # shorter than their neighbours (midpoints stay on the plane).
+        cut_edges = [e for e in bm.edges
+                     if abs(e.verts[0].co[ax]) <= eps and abs(e.verts[1].co[ax]) <= eps]
+        if len(cut_edges) >= 4:
+            lens = sorted(e.calc_length() for e in cut_edges)
+            median = lens[len(lens) // 2]
+            short = [e for e in cut_edges if e.calc_length() < 0.2 * median]
+            if short:
+                bmesh.ops.collapse(bm, edges=short, uvs=False)
+                for v in bm.verts:
+                    if abs(v.co[ax]) <= max(eps, 0.2 * median):
+                        v.co[ax] = 0.0
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     bm.to_mesh(mesh)
     bm.free()
@@ -205,15 +220,51 @@ def bisect_to_half(work_obj, axes, eps: float) -> bool:
     return len(mesh.polygons) > 0
 
 
-def mirror_weld(work_obj, axes, snap_tol: float, weld_eps: float = 1e-7) -> None:
+def _boundary_loops(bm):
+    """Connected components of boundary edges, as lists of edges."""
+    edges = [e for e in bm.edges if len(e.link_faces) == 1]
+    seen = set()
+    loops = []
+    for start in edges:
+        if start in seen:
+            continue
+        comp = []
+        stack = [start]
+        seen.add(start)
+        while stack:
+            e = stack.pop()
+            comp.append(e)
+            for v in e.verts:
+                for ne in v.link_edges:
+                    if ne not in seen and len(ne.link_faces) == 1:
+                        seen.add(ne)
+                        stack.append(ne)
+        loops.append(comp)
+    return loops
+
+
+def mirror_weld(work_obj, axes, snap_tol: float, weld_eps: float = 1e-7) -> int:
     """Snap the cut boundary exactly onto the planes, then mirror + weld so the
-    result is bit-exact symmetric."""
+    result is bit-exact symmetric. Returns the number of boundary edges that
+    remained near a symmetry plane (0 = watertight seam)."""
     mesh = work_obj.data
     bm = bmesh.new()
     bm.from_mesh(mesh)
     bm.verts.ensure_lookup_table()
 
     for ax in axes:
+        # Snap whole cut loops, not just verts inside a fixed distance: the
+        # solver may drift cut verts off the plane by a fraction of the LOCAL
+        # edge length, which on coarse regions is far beyond any global
+        # tolerance (this is what left holes along the seam).
+        for comp in _boundary_loops(bm):
+            verts = {v for e in comp for v in e.verts}
+            span = max(abs(v.co[ax]) for v in verts)
+            lens = sorted(e.calc_length() for e in comp)
+            median = lens[len(lens) // 2] if lens else 0.0
+            if span <= max(snap_tol, 0.5 * median):
+                for v in verts:
+                    v.co[ax] = 0.0
         for v in bm.verts:
             if v.is_boundary and abs(v.co[ax]) <= snap_tol:
                 v.co[ax] = 0.0
@@ -230,11 +281,153 @@ def mirror_weld(work_obj, axes, snap_tol: float, weld_eps: float = 1e-7) -> None
             bmesh.ops.remove_doubles(bm, verts=plane_verts, dist=weld_eps)
         bm.verts.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
+        # Close residual seam cracks: cut verts that drifted past every earlier
+        # snap were mirrored into near-coincident pairs straddling the plane.
+        residual = [v for v in bm.verts if v.is_boundary and abs(v.co[ax]) <= snap_tol]
+        if residual:
+            for v in residual:
+                v.co[ax] = 0.0
+            bmesh.ops.remove_doubles(bm, verts=residual, dist=max(weld_eps, snap_tol * 0.1))
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+
+    # Any small boundary loop at (or straddling) a symmetry plane is a pinhole
+    # the cut/weld left behind; fill it. Larger near-plane loops are treated as
+    # legitimate original openings and left alone. The vert set of a straddling
+    # pinhole is its own mirror image, so exact symmetry is preserved.
+    for ax in axes:
+        tol = 2.0 * max(snap_tol, weld_eps)
+        near = [
+            e for e in bm.edges
+            if len(e.link_faces) == 1
+            and abs(e.verts[0].co[ax]) <= tol and abs(e.verts[1].co[ax]) <= tol
+        ]
+        pinholes = []
+        seen = set()
+        for start in near:
+            if start in seen:
+                continue
+            comp = [start]
+            seen.add(start)
+            stack = [start]
+            open_chain = False
+            while stack:
+                cur = stack.pop()
+                for v in cur.verts:
+                    for ne in v.link_edges:
+                        if len(ne.link_faces) != 1 or ne in seen:
+                            continue
+                        if ne not in near:
+                            open_chain = True  # part of a bigger boundary
+                            continue
+                        seen.add(ne)
+                        comp.append(ne)
+                        stack.append(ne)
+            if not open_chain and 3 <= len(comp) <= 6:
+                pinholes.extend(comp)
+        if pinholes:
+            try:
+                bmesh.ops.holes_fill(bm, edges=pinholes, sides=6)
+            except Exception:
+                pass
+            bm.verts.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
 
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+    # Count remaining seam defects: boundary loops confined to a symmetry
+    # plane. Boundary chains merely crossing the plane are original openings.
+    leftover = 0
+    for ax in axes:
+        tol = 2.0 * max(snap_tol, weld_eps)
+        near = {
+            e for e in bm.edges
+            if len(e.link_faces) == 1
+            and abs(e.verts[0].co[ax]) <= tol and abs(e.verts[1].co[ax]) <= tol
+        }
+        seen = set()
+        for start in near:
+            if start in seen:
+                continue
+            comp = [start]
+            seen.add(start)
+            stack = [start]
+            confined = True
+            while stack:
+                cur = stack.pop()
+                for v in cur.verts:
+                    for ne in v.link_edges:
+                        if len(ne.link_faces) != 1 or ne in seen:
+                            continue
+                        if ne not in near:
+                            confined = False
+                            continue
+                        seen.add(ne)
+                        comp.append(ne)
+                        stack.append(ne)
+            if confined:
+                leftover += len(comp)
     bm.to_mesh(mesh)
     bm.free()
     mesh.update()
+    return leftover
+
+
+def fix_orientation(work_obj, ref_mesh) -> int:
+    """Flip whole shells whose normals disagree with the nearest source
+    surface. recalc_face_normals' outward heuristic is unreliable on open or
+    multi-shell meshes, so orientation is voted per shell against the input.
+    Returns the number of faces flipped."""
+    me = work_obj.data
+    if not len(me.polygons) or not len(ref_mesh.polygons):
+        return 0
+
+    ref_bm = bmesh.new()
+    ref_bm.from_mesh(ref_mesh)
+    bmesh.ops.triangulate(ref_bm, faces=ref_bm.faces[:])
+    ref_verts = [v.co[:] for v in ref_bm.verts]
+    ref_faces = [[v.index for v in f.verts] for f in ref_bm.faces]
+    ref_normals = [f.normal.copy() for f in ref_bm.faces]
+    ref_bm.free()
+    try:
+        bvh = BVHTree.FromPolygons(ref_verts, ref_faces, all_triangles=True)
+    except Exception:
+        return 0
+
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.faces.ensure_lookup_table()
+    visited = set()
+    flipped_faces = 0
+    changed = False
+    for f0 in bm.faces:
+        if f0.index in visited:
+            continue
+        comp = []
+        stack = [f0]
+        visited.add(f0.index)
+        while stack:
+            f = stack.pop()
+            comp.append(f)
+            for e in f.edges:
+                for nf in e.link_faces:
+                    if nf.index not in visited:
+                        visited.add(nf.index)
+                        stack.append(nf)
+        step = max(1, len(comp) // 200)
+        score = 0.0
+        for f in comp[::step]:
+            hit = bvh.find_nearest(f.calc_center_median())
+            if hit[0] is not None and hit[2] is not None:
+                score += f.normal.dot(ref_normals[hit[2]])
+        if score < 0.0:
+            bmesh.ops.reverse_faces(bm, faces=comp)
+            flipped_faces += len(comp)
+            changed = True
+    if changed:
+        bm.to_mesh(me)
+        me.update()
+    bm.free()
+    return flipped_faces
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +581,12 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
         post_pass(work_obj, int(max(12, round(face_target / float(2 ** len(axes))))))
 
     snap_tol = max(_mean_edge_length(work_obj.data) * 0.25, 1e-6)
-    mirror_weld(work_obj, axes, snap_tol)
+    leftover = mirror_weld(work_obj, axes, snap_tol)
+    report["seam_open_edges"] = leftover
+    if leftover:
+        report.setdefault("warnings", []).append(
+            f"exact symmetry: {leftover} boundary edges remain near the seam"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +685,9 @@ def run_remesh(context, obj, s) -> dict:
 
         preprocess(context, work, s, report)
 
+        # reference for post-remesh orientation repair (pre-bisect, full mesh)
+        ref_mesh = work.data.copy()
+
         # keep the pre-remesh mesh around for the adaptive post-pass
         src_mesh = None
         adaptive = float(getattr(s, "adaptive_size", 0.0)) > 0.0
@@ -517,10 +718,29 @@ def run_remesh(context, obj, s) -> dict:
                 "adaptive post-pass only runs on the QuadriFlow backend"
             )
 
-        run_backend(context, backend, work, s, face_target, report, post_pass=post_pass)
+        try:
+            run_backend(context, backend, work, s, face_target, report, post_pass=post_pass)
 
-        if len(work.data.polygons) == 0:
-            raise RuntimeError("the solver returned an empty mesh")
+            if len(work.data.polygons) == 0:
+                raise RuntimeError("the solver returned an empty mesh")
+
+            bstats = report.get("backend_stats") or {}
+            if bstats.get("unsolvable_parts"):
+                report["warnings"].append(
+                    "%d degenerate shell(s) (%d faces) refused by the solver; "
+                    "their original topology was kept"
+                    % (bstats["unsolvable_parts"], bstats.get("unsolvable_part_faces", 0))
+                )
+
+            try:
+                report["orientation_flipped_faces"] = fix_orientation(work, ref_mesh)
+            except Exception as exc:
+                report["warnings"].append(f"orientation repair failed: {exc}")
+        finally:
+            try:
+                bpy.data.meshes.remove(ref_mesh)
+            except Exception:
+                pass
 
         if adaptive:
             relaxed = (report.get("adaptive_relax") or {}).get("iterations", 0)
