@@ -217,6 +217,25 @@ def split_small_shells_aside(work_obj, limit: int):
     tmp.faces.ensure_lookup_table()
     doomed = [f for f in tmp.faces if f.index not in kept]
     bmesh.ops.delete(tmp, geom=doomed, context='FACES')
+    # These shells are rejoined verbatim after the mirror, so they are the one
+    # part of the mesh that never reaches the backend's preclean. Give them the
+    # same minimal degeneracy pass here, otherwise authored debris (exactly
+    # coincident vertices, and the zero-length edges and slivers between them)
+    # is copied straight into the result and reads as seam damage.
+    weld = max(1e-6, 1e-4 * (_mean_edge_length(mesh) or 1e-2))
+    try:
+        bmesh.ops.remove_doubles(tmp, verts=tmp.verts[:], dist=weld)
+    except Exception:
+        pass
+    slivers = [f for f in tmp.faces if f.calc_area() <= 1e-14]
+    if slivers:
+        bmesh.ops.delete(tmp, geom=slivers, context='FACES')
+    stray_e = [e for e in tmp.edges if not e.link_faces]
+    if stray_e:
+        bmesh.ops.delete(tmp, geom=stray_e, context='EDGES')
+    stray_v = [v for v in tmp.verts if not v.link_faces]
+    if stray_v:
+        bmesh.ops.delete(tmp, geom=stray_v, context='VERTS')
     tmp.to_mesh(side_mesh)
     tmp.free()
     bmesh.ops.delete(bm, geom=small_faces, context='FACES')
@@ -245,20 +264,29 @@ def rejoin_side_mesh(work_obj, side_mesh) -> None:
         pass
 
 
-def bisect_to_half(work_obj, axes, eps: float) -> bool:
+def bisect_to_half(work_obj, axes, eps: float, pad: float = 0.0) -> bool:
     """Cut the mesh at every symmetry plane, keep the negative side, and snap
-    the cut vertices exactly onto the planes. False if nothing survived."""
+    the cut vertices exactly onto the planes. False if nothing survived.
+
+    With ``pad`` > 0 the cut happens at +pad instead of the plane itself, so
+    the solver keeps full local context around the plane — features that sit
+    within a couple of edge lengths of the centerline (inner toes, nose tips)
+    would otherwise be flattened by the pinned cut boundary. The surplus band
+    is trimmed back to the exact plane by a second, unpadded call after
+    solving."""
     mesh = work_obj.data
     bm = bmesh.new()
     bm.from_mesh(mesh)
     for ax in axes:
         no = Vector((0.0, 0.0, 0.0))
         no[ax] = 1.0
+        co = Vector((0.0, 0.0, 0.0))
+        co[ax] = pad
         geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
         try:
             bmesh.ops.bisect_plane(
                 bm, geom=geom, dist=eps,
-                plane_co=(0.0, 0.0, 0.0), plane_no=no,
+                plane_co=tuple(co), plane_no=no,
                 use_snap_center=False, clear_outer=True, clear_inner=False,
             )
         except Exception:
@@ -268,27 +296,114 @@ def bisect_to_half(work_obj, axes, eps: float) -> bool:
             bm.free()
             return False
         for v in bm.verts:
-            if abs(v.co[ax]) <= eps:
+            if pad == 0.0 and abs(v.co[ax]) <= eps:
                 v.co[ax] = 0.0
         # The cut leaves sliver edges/faces where the plane grazed the input;
         # QuadriFlow can spin (near-)forever on those. Collapse cut edges much
-        # shorter than their neighbours (midpoints stay on the plane).
+        # shorter than their neighbours (midpoints stay on the cut plane).
         cut_edges = [e for e in bm.edges
-                     if abs(e.verts[0].co[ax]) <= eps and abs(e.verts[1].co[ax]) <= eps]
+                     if abs(e.verts[0].co[ax] - pad) <= eps
+                     and abs(e.verts[1].co[ax] - pad) <= eps]
         if len(cut_edges) >= 4:
             lens = sorted(e.calc_length() for e in cut_edges)
             median = lens[len(lens) // 2]
             short = [e for e in cut_edges if e.calc_length() < 0.2 * median]
             if short:
                 bmesh.ops.collapse(bm, edges=short, uvs=False)
-                for v in bm.verts:
-                    if abs(v.co[ax]) <= max(eps, 0.2 * median):
-                        v.co[ax] = 0.0
+                # Only re-snap what the collapse actually touched. Snapping a
+                # whole 0.2-edge-length band (as this used to) drags the second
+                # vertex row onto the plane as well, which buries interior
+                # edges and whole faces *inside* the symmetry plane; mirroring
+                # then folds those onto their own copies (4-face edges,
+                # zero-thickness double flaps) and tears the seam back open.
+                if pad == 0.0:
+                    for v in bm.verts:
+                        if abs(v.co[ax]) <= eps:
+                            v.co[ax] = 0.0
     bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     bm.to_mesh(mesh)
     bm.free()
     mesh.update()
     return len(mesh.polygons) > 0
+
+
+def _clear_plane_interior(bm, ax: int, eps: float, nudge: float) -> int:
+    """Make the symmetry plane touch nothing but the open cut ring.
+
+    A half that is about to be mirrored may carry *interior* geometry lying
+    exactly in the plane — faces flattened into it, edges whose two faces both
+    sit inside the half. ``bmesh.ops.mirror`` folds that geometry onto its own
+    reflection: in-plane edges end up with four faces and in-plane faces become
+    zero-thickness double flaps. The weld then cannot resolve them, which is
+    where the seam holes and the coincident-vertex debris came from.
+
+    Two local repairs, applied until the plane is clean:
+
+    * a face lying entirely in the plane is a zero-thickness membrane; deleting
+      it hands its rim to the mirror, which is the topology that was meant. A
+      face is only removed when it has a neighbour outside the plane, so a whole
+      shell that legitimately lives in the plane is never touched.
+    * any other vertex sitting in the plane without belonging to the cut ring is
+      pushed one hair inside the half, far below any visible scale but well
+      above the weld epsilon.
+
+    Returns the number of elements repaired.
+    """
+    def on_plane(v):
+        return abs(v.co[ax]) <= eps
+
+    repaired = 0
+    for _ in range(4):
+        flat = set()
+        for f in bm.faces:
+            if all(on_plane(v) for v in f.verts):
+                flat.add(f)
+        doomed = [f for f in flat
+                  if any(nf is not f and nf not in flat
+                         for e in f.edges for nf in e.link_faces)]
+        if doomed:
+            bmesh.ops.delete(bm, geom=doomed, context='FACES')
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            repaired += len(doomed)
+        # vertices entitled to stay on the plane: the cut ring, i.e. those
+        # carrying a boundary edge that lies in the plane
+        ring = set()
+        for e in bm.edges:
+            if len(e.link_faces) == 1 and on_plane(e.verts[0]) and on_plane(e.verts[1]):
+                ring.add(e.verts[0])
+                ring.add(e.verts[1])
+        stray = [v for v in bm.verts
+                 if v.link_faces and on_plane(v) and v not in ring]
+        for v in stray:
+            v.co[ax] = -nudge
+        repaired += len(stray)
+        if not doomed and not stray:
+            break
+    return repaired
+
+
+def _fuse_seam_tris(work_obj, axes) -> int:
+    """join_triangles on the tri row a post-solve plane cut leaves behind."""
+    mesh = work_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    band = 2.0 * (_mean_edge_length(mesh) or 1e-3)
+    tris = [f for f in bm.faces
+            if len(f.verts) == 3
+            and any(any(abs(v.co[ax]) < band for v in f.verts) for ax in axes)]
+    fused = 0
+    if tris:
+        before = len(bm.faces)
+        bmesh.ops.join_triangles(bm, faces=tris,
+                                 angle_face_threshold=3.15,
+                                 angle_shape_threshold=3.15)
+        fused = before - len(bm.faces)
+        bm.to_mesh(mesh)
+        mesh.update()
+    bm.free()
+    return fused
 
 
 def _boundary_loops(bm):
@@ -341,6 +456,9 @@ def mirror_weld(work_obj, axes, snap_tol: float, weld_eps: float = 1e-7) -> int:
                 v.co[ax] = 0.0
 
     for ax in axes:
+        # the mirror only produces a watertight seam when the plane carries
+        # nothing but the open cut ring
+        _clear_plane_interior(bm, ax, weld_eps, max(weld_eps * 10.0, snap_tol * 1e-3))
         geom = bm.verts[:] + bm.edges[:] + bm.faces[:]
         bmesh.ops.mirror(
             bm, geom=geom, matrix=Matrix.Identity(4),
@@ -366,35 +484,25 @@ def mirror_weld(work_obj, axes, snap_tol: float, weld_eps: float = 1e-7) -> int:
     # the cut/weld left behind; fill it. Larger near-plane loops are treated as
     # legitimate original openings and left alone. The vert set of a straddling
     # pinhole is its own mirror image, so exact symmetry is preserved.
+    #
+    # Both this pass and the leftover count below classify whole boundary
+    # components (from _boundary_loops, which walks bm.edges in index order): a
+    # component counts as a seam defect only when *every* one of its edges hugs
+    # a symmetry plane. The old code grew each component out of a set of
+    # near-plane edges and marked it "open" only when it happened to bump into
+    # an edge outside that set — a test the shared `seen` guard could skip
+    # entirely, so the verdict depended on traversal order, and for the count
+    # below on Python's set iteration order, which varies between runs.
     for ax in axes:
         tol = 2.0 * max(snap_tol, weld_eps)
-        near = [
-            e for e in bm.edges
-            if len(e.link_faces) == 1
-            and abs(e.verts[0].co[ax]) <= tol and abs(e.verts[1].co[ax]) <= tol
-        ]
+
+        def confined(comp, _ax=ax, _tol=tol):
+            return all(abs(e.verts[0].co[_ax]) <= _tol
+                       and abs(e.verts[1].co[_ax]) <= _tol for e in comp)
+
         pinholes = []
-        seen = set()
-        for start in near:
-            if start in seen:
-                continue
-            comp = [start]
-            seen.add(start)
-            stack = [start]
-            open_chain = False
-            while stack:
-                cur = stack.pop()
-                for v in cur.verts:
-                    for ne in v.link_edges:
-                        if len(ne.link_faces) != 1 or ne in seen:
-                            continue
-                        if ne not in near:
-                            open_chain = True  # part of a bigger boundary
-                            continue
-                        seen.add(ne)
-                        comp.append(ne)
-                        stack.append(ne)
-            if not open_chain and 3 <= len(comp) <= 6:
+        for comp in _boundary_loops(bm):
+            if 3 <= len(comp) <= 6 and confined(comp):
                 pinholes.extend(comp)
         if pinholes:
             try:
@@ -410,32 +518,9 @@ def mirror_weld(work_obj, axes, snap_tol: float, weld_eps: float = 1e-7) -> int:
     leftover = 0
     for ax in axes:
         tol = 2.0 * max(snap_tol, weld_eps)
-        near = {
-            e for e in bm.edges
-            if len(e.link_faces) == 1
-            and abs(e.verts[0].co[ax]) <= tol and abs(e.verts[1].co[ax]) <= tol
-        }
-        seen = set()
-        for start in near:
-            if start in seen:
-                continue
-            comp = [start]
-            seen.add(start)
-            stack = [start]
-            confined = True
-            while stack:
-                cur = stack.pop()
-                for v in cur.verts:
-                    for ne in v.link_edges:
-                        if len(ne.link_faces) != 1 or ne in seen:
-                            continue
-                        if ne not in near:
-                            confined = False
-                            continue
-                        seen.add(ne)
-                        comp.append(ne)
-                        stack.append(ne)
-            if confined:
+        for comp in _boundary_loops(bm):
+            if all(abs(e.verts[0].co[ax]) <= tol and abs(e.verts[1].co[ax]) <= tol
+                   for e in comp):
                 leftover += len(comp)
     bm.to_mesh(mesh)
     bm.free()
@@ -753,10 +838,20 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
                 f"small-shell split failed: {exc}")
             side_mesh = None
 
+    # pad the cut by ~3 target edge lengths: the pinned cut boundary flattens
+    # features within a couple of edges of the plane (inner toes, nose tips);
+    # the surplus band is trimmed back after solving
+    try:
+        area = analysis.world_area(work_obj.data, work_obj.matrix_world)
+        pad = 3.0 * float(np.sqrt(max(area, 1e-12) / max(requested, 12)))
+    except Exception:
+        pad = 0.0
+    report["symmetry_pad"] = round(pad, 5)
+
     # keep a copy so we can fall back if bisecting destroys the mesh
     backup = bmesh.new()
     backup.from_mesh(work_obj.data)
-    ok = bisect_to_half(work_obj, axes, eps)
+    ok = bisect_to_half(work_obj, axes, eps, pad=pad)
     if not ok:
         backup.to_mesh(work_obj.data)
         backup.free()
@@ -785,6 +880,33 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
 
     if post_pass is not None:
         post_pass(work_obj, int(max(12, round(face_target / float(2 ** len(axes))))))
+
+    if pad > 0.0:
+        # cut the solved padded half back to the exact plane with the proven
+        # bisect (clean plane boundary, sliver collapse), then fuse the tri
+        # row the cut leaves into quads where possible
+        if not bisect_to_half(work_obj, axes, eps):
+            report.setdefault("warnings", []).append(
+                "exact symmetry: post-solve trim failed; seam may be off-plane")
+        _fuse_seam_tris(work_obj, axes)
+        # the cut grazes solved verts, leaving coincident-vertex debris
+        # (zero-length boundary edges) on the plane — weld it away
+        bmc = bmesh.new()
+        bmc.from_mesh(work_obj.data)
+        med = _mean_edge_length(work_obj.data) or 1e-3
+        # candidates are verts *on* the plane only: widening this band lets the
+        # weld pull second-row vertices onto the plane, which is exactly the
+        # in-plane interior geometry the mirror cannot handle
+        near = [v for v in bmc.verts
+                if any(abs(v.co[ax]) < 1e-3 * med for ax in axes)]
+        if near:
+            bmesh.ops.remove_doubles(bmc, verts=near, dist=1e-4 * med)
+            deg = [f for f in bmc.faces if f.calc_area() <= 1e-16]
+            if deg:
+                bmesh.ops.delete(bmc, geom=deg, context='FACES')
+            bmc.to_mesh(work_obj.data)
+            work_obj.data.update()
+        bmc.free()
 
     snap_tol = max(_mean_edge_length(work_obj.data) * 0.25, 1e-6)
     leftover = mirror_weld(work_obj, axes, snap_tol)
@@ -968,6 +1090,15 @@ def run_remesh(context, obj, s) -> dict:
                 report["orientation_flipped_faces"] = fix_orientation(work, ref_mesh)
             except Exception as exc:
                 report["warnings"].append(f"orientation repair failed: {exc}")
+
+            # purge degenerate debris (zero-length edges, zero-area faces)
+            # before data transfer sees the mesh
+            try:
+                if work.data.validate(verbose=False):
+                    report["validated"] = True
+                work.data.update()
+            except Exception:
+                pass
         finally:
             try:
                 bpy.data.meshes.remove(ref_mesh)

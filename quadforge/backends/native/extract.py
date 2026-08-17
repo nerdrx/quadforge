@@ -46,8 +46,16 @@ Pipeline
      * n >= 7: centroid fan - two boundary edges per quad.  Only ever touches
        edges with exactly one face, so it can never create a non-manifold
        edge,
+     A geometrically collinear 3/4-loop cannot be closed by a face at all
+     (``mesh.validate()`` would drop the zero-area result and re-open the
+     hole), so its shortest side is welded instead,
+   * drop dangling faces whose every edge is a boundary edge,
    * remove 2-valence doublets (two quads sharing two edges -> one quad),
-   * fuse leftover adjacent triangle pairs into quads,
+   * fuse adjacent triangle pairs into quads, then **annihilate the rest
+     pairwise**: a leftover triangle is walked through the quads separating
+     it from another triangle (merge tri+quad into a pentagon, re-split so
+     the triangle lands on the far side) until the two meet and fuse.  This
+     is what takes the closed fixtures from ~96% to 100% quads,
    * repeat until no hole and no over-used edge remains.
 
 5. **Relax + reproject.**  3-5 tangent-space Laplacian iterations, each
@@ -59,9 +67,14 @@ Pipeline
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 EPS = 1e-12
+
+# set QF_EXTRACT_DEBUG=1 to trace the repair stage
+_DEBUG = bool(os.environ.get("QF_EXTRACT_DEBUG"))
 
 # collapse an input edge whose two position-field samples are closer than
 # this fraction of the local target edge length, even when the two tangent
@@ -71,6 +84,17 @@ WELD_EPS = 0.30
 # orbits longer than this are treated as extraction failures and left to the
 # hole filler
 MAX_ORBIT = 8
+
+# The position lattice is read off the input graph, so an input edge longer
+# than ~1.5 rho cannot produce a lattice step at all: it rounds to an offset
+# of 2+ and is discarded, which strips every face off the under-sampled part
+# of the surface.  Real sculpts are wildly non-uniform (a Dinasty-style avatar
+# has 15% of its edges longer than rho while the hair plates are 5x finer), so
+# the mesh is conformingly refined until every edge is short enough.  Midpoint
+# splits leave the piecewise-linear surface bit-for-bit identical.
+SPLIT_RATIO = 0.55
+MAX_REFINE_ROUNDS = 8
+MAX_REFINE_VERTS = 400_000
 
 __all__ = ["extract", "extract_quads", "make_solution"]
 
@@ -118,6 +142,27 @@ def _boundary_edges(F):
     return uniq[counts == 1]
 
 
+def _tri_areas(V, F):
+    a = V[F[:, 1]] - V[F[:, 0]]
+    b = V[F[:, 2]] - V[F[:, 0]]
+    cr = np.cross(a, b)
+    return 0.5 * np.sqrt(np.einsum("ij,ij->i", cr, cr))
+
+
+def _poly_area(P, faces):
+    """Total area of a 3/4-gon soup (fan triangulation)."""
+    if not len(faces):
+        return 0.0
+    tris, quads = _tri_quad_arrays(faces)
+    s = 0.0
+    if len(tris):
+        s += float(_tri_areas(P, tris).sum())
+    if len(quads):
+        s += float(_tri_areas(P, quads[:, [0, 1, 2]]).sum())
+        s += float(_tri_areas(P, quads[:, [0, 2, 3]]).sum())
+    return s
+
+
 def _any_tangent(N):
     alt = np.zeros((len(N), 3))
     pick = np.abs(N[:, 0]) < 0.9
@@ -138,6 +183,129 @@ def _sol_get(sol, name):
     if isinstance(sol, dict):
         return sol[name]
     return getattr(sol, name)
+
+
+# --------------------------------------------------------------------------
+# adaptive refinement: make the input resolvable by the lattice
+# --------------------------------------------------------------------------
+
+def _edge_lookup(e, n):
+    """``(a, b) -> row in e`` for the undirected edge array ``e`` (i<j)."""
+    key = e[:, 0] * np.int64(n) + e[:, 1]
+    order = np.argsort(key, kind="stable")
+    skey = key[order]
+
+    def eid(x, y):
+        lo = np.minimum(x, y)
+        hi = np.maximum(x, y)
+        pos = np.searchsorted(skey, lo * np.int64(n) + hi)
+        return order[np.clip(pos, 0, len(skey) - 1)]
+    return eid
+
+
+def _refine_for_lattice(V, F, N, Q, rho, sharp, ratio=SPLIT_RATIO,
+                        max_verts=MAX_REFINE_VERTS,
+                        rounds=MAX_REFINE_ROUNDS):
+    """Conformingly split every input edge longer than ``ratio * rho``.
+
+    Red-green refinement (1/2/3 marked edges per triangle -> 2/3/4 triangles),
+    so no hanging nodes appear.  New vertices sit on edge midpoints, which
+    keeps the surface exactly as it was; ``N``/``Q``/``rho`` are interpolated
+    (``Q`` through a 4-RoSy match so the two endpoint crosses are averaged in
+    the same rotational class).  ``sharp`` edges are split along with them.
+    """
+    for _ in range(rounds):
+        n = len(V)
+        e = _build_edges(F)
+        d = V[e[:, 1]] - V[e[:, 0]]
+        L = np.sqrt(np.einsum("ij,ij->i", d, d))
+        rho_e = np.maximum(0.5 * (rho[e[:, 0]] + rho[e[:, 1]]), EPS)
+        over = L / rho_e
+        mark = over > ratio
+        if not mark.any():
+            break
+        budget = max_verts - n
+        if budget < 8:
+            break
+        if int(mark.sum()) > budget:
+            # split the worst offenders first
+            cand = np.nonzero(mark)[0]
+            keep = cand[np.argsort(-over[cand])[:budget]]
+            mark = np.zeros(len(e), dtype=bool)
+            mark[keep] = True
+
+        nm = int(mark.sum())
+        new_id = np.full(len(e), -1, dtype=np.int64)
+        new_id[mark] = n + np.arange(nm, dtype=np.int64)
+        ea, eb = e[mark, 0], e[mark, 1]
+
+        Vm = 0.5 * (V[ea] + V[eb])
+        Nm = normalize(N[ea] + N[eb])
+        Qm = Q[ea] + _match_4rosy(Q[eb], N[eb], Q[ea])
+        Qm = Qm - Nm * _dot(Qm, Nm)[:, None]
+        ql = np.sqrt(np.einsum("ij,ij->i", Qm, Qm))
+        bad = ql < 1e-9
+        if bad.any():
+            Qm[bad] = _any_tangent(Nm[bad])
+        Qm = normalize(Qm)
+        rhom = 0.5 * (rho[ea] + rho[eb])
+
+        eid = _edge_lookup(e, n)
+        M = np.stack([new_id[eid(F[:, 0], F[:, 1])],
+                      new_id[eid(F[:, 1], F[:, 2])],
+                      new_id[eid(F[:, 2], F[:, 0])]], axis=1)
+        hit = M >= 0
+        cnt = hit.sum(axis=1)
+        arange3 = np.arange(3)[None, :]
+        out = [F[cnt == 0]]
+
+        sel = cnt == 1
+        if sel.any():
+            k = np.argmax(hit[sel], axis=1)          # rotate marked edge to 0
+            idx = (arange3 + k[:, None]) % 3
+            T = np.take_along_axis(F[sel], idx, axis=1)
+            m0 = np.take_along_axis(M[sel], idx, axis=1)[:, 0]
+            out.append(np.stack([T[:, 0], m0, T[:, 2]], axis=1))
+            out.append(np.stack([m0, T[:, 1], T[:, 2]], axis=1))
+
+        sel = cnt == 2
+        if sel.any():
+            u = np.argmin(hit[sel], axis=1)          # the unmarked edge
+            idx = (arange3 + ((u + 1) % 3)[:, None]) % 3
+            T = np.take_along_axis(F[sel], idx, axis=1)
+            Ms = np.take_along_axis(M[sel], idx, axis=1)
+            m0, m1 = Ms[:, 0], Ms[:, 1]
+            out.append(np.stack([T[:, 0], m0, T[:, 2]], axis=1))
+            out.append(np.stack([m0, T[:, 1], m1], axis=1))
+            out.append(np.stack([m0, m1, T[:, 2]], axis=1))
+
+        sel = cnt == 3
+        if sel.any():
+            T, Ms = F[sel], M[sel]
+            m0, m1, m2 = Ms[:, 0], Ms[:, 1], Ms[:, 2]
+            out.append(np.stack([T[:, 0], m0, m2], axis=1))
+            out.append(np.stack([m0, T[:, 1], m1], axis=1))
+            out.append(np.stack([m1, T[:, 2], m2], axis=1))
+            out.append(np.stack([m0, m1, m2], axis=1))
+
+        if sharp is not None and len(sharp):
+            sm = new_id[eid(sharp[:, 0], sharp[:, 1])]
+            spl = sm >= 0
+            if spl.any():
+                sharp = np.concatenate([
+                    sharp[~spl],
+                    np.stack([sharp[spl, 0], sm[spl]], axis=1),
+                    np.stack([sm[spl], sharp[spl, 1]], axis=1)], axis=0)
+
+        F = np.concatenate(out, axis=0)
+        V = np.concatenate([V, Vm], axis=0)
+        N = np.concatenate([N, Nm], axis=0)
+        Q = np.concatenate([Q, Qm], axis=0)
+        rho = np.concatenate([rho, rhom], axis=0)
+        if _DEBUG:
+            print("   [refine] verts=%d tris=%d (split %d edges, worst "
+                  "L/rho=%.2f)" % (len(V), len(F), nm, over.max()))
+    return V, F, N, Q, rho, sharp
 
 
 # --------------------------------------------------------------------------
@@ -534,12 +702,13 @@ def _fan_parts(g):
     return parts
 
 
-def _split_ngon(P, f, forbidden=None):
+def _split_ngon(P, f, forbidden=None, skip=None):
     """Split an n-gon (n >= 5) into quads plus at most one triangle.
 
-    ``forbidden`` is a set of undirected edges that must not be created (they
-    already exist elsewhere in the mesh and would become non-manifold).
-    Returns ``None`` when every rotation would need a forbidden chord.
+    ``forbidden`` is a set of undirected edges that must not be *created*
+    (they already exist elsewhere in the mesh and a second use would break
+    manifoldness); ``skip`` lists the polygon's own edges, which are of course
+    allowed.  Returns ``None`` when every rotation needs a forbidden chord.
     """
     k = len(f)
     best = None
@@ -553,7 +722,7 @@ def _split_ngon(P, f, forbidden=None):
                 for a in range(m):
                     u, v = part[a], part[(a + 1) % m]
                     e = (u, v) if u < v else (v, u)
-                    if e in forbidden:
+                    if e in forbidden and not (skip and e in skip):
                         bad = True
                         break
                 if bad:
@@ -582,21 +751,29 @@ def _edge_use(faces):
     return use
 
 
-def _dedupe(P, faces):
+def _dedupe(P, faces, drop_degenerate=True):
+    """Drop faces with repeated indices, duplicates (Blender's ``validate()``
+    removes them, which would silently re-open a hole) and - optionally -
+    zero-area faces."""
     seen = set()
     out = []
     for f in faces:
         if len(f) < 3 or len(set(f)) != len(f):
+            if _DEBUG:
+                print("   [dedupe] repeated %s" % (f,))
             continue
         key = tuple(sorted(f))
         if key in seen:
+            if _DEBUG:
+                print("   [dedupe] duplicate %s" % (f,))
             continue
-        pts = P[list(f)]
-        a = pts[1] - pts[0]
-        b = pts[2] - pts[0]
-        c = np.cross(a, b)
-        if float(c @ c) < 1e-26:
-            continue
+        if drop_degenerate:
+            pts = P[list(f)]
+            c = np.cross(pts[1] - pts[0], pts[2] - pts[0])
+            if float(c @ c) < 1e-26:
+                if _DEBUG:
+                    print("   [dedupe] degenerate %s %s" % (f, pts.tolist()))
+                continue
         seen.add(key)
         out.append(tuple(f))
     return out
@@ -701,6 +878,32 @@ def _make_injective(faces):
     return [f for i, f in enumerate(faces) if i not in drop]
 
 
+def _drop_isolated(faces, min_keep=8):
+    """Remove dangling faces whose every edge is a boundary edge.
+
+    Such a face is a floating flap: trying to *fill* the hole around it would
+    only duplicate it.  Dropping it makes its edges disappear entirely.
+    """
+    for _ in range(4):
+        if len(faces) <= min_keep:
+            return faces
+        use = _edge_use(faces)
+        drop = set()
+        for i, f in enumerate(faces):
+            k = len(f)
+            nb = 0
+            for a in range(k):
+                u, v = f[a], f[(a + 1) % k]
+                if len(use[(u, v) if u < v else (v, u)]) == 1:
+                    nb += 1
+            if nb >= k:
+                drop.add(i)
+        if not drop:
+            return faces
+        faces = [f for i, f in enumerate(faces) if i not in drop]
+    return faces
+
+
 def _simple_cycles(loop):
     """Decompose a (possibly pinched) closed walk into simple cycles."""
     out = []
@@ -747,16 +950,16 @@ def _hole_loops(faces):
         seq = []
         h = h0
         ok = True
-        for _ in range(200000):
+        for _ in range(1 << 22):
             if h in visited:
-                ok = h is h0
+                ok = False
                 break
             visited.add(h)
             seq.append(h[0])
             u, v = h
             e = (v, u)
             nxt = None
-            for _r in range(64):
+            for _r in range(256):
                 z = prev_of[e][0]
                 if (v, z) in dmap:
                     e = (v, z)
@@ -774,52 +977,88 @@ def _hole_loops(faces):
     return loops
 
 
-def _fill_holes(P, faces, cbnd, extra_pts, project=None):
+def _collapse_vertex(faces, keep, drop):
+    """Weld ``drop`` onto ``keep`` (used to close geometrically degenerate
+    slivers, e.g. three collinear samples on a crease)."""
+    out = []
+    for f in faces:
+        g = [keep if v == drop else v for v in f]
+        k = len(g)
+        h = [g[a] for a in range(k) if g[a] != g[(a + 1) % k]]
+        if len(h) >= 3 and len(set(h)) == len(h):
+            out.append(tuple(h))
+    return out
+
+
+def _fill_holes(P, faces, cbnd):
     """Close every hole that is not a genuine input boundary.
 
-    ``extra_pts`` is appended to in place with the centroid vertices; their
-    indices continue after ``len(P) + len(extra_pts)``.
+    Returns ``(faces, new_points, welds, changed)``.  ``new_points`` are the
+    centroid vertices of the fan-filled loops (their indices continue after
+    ``len(P)``); ``welds`` are ``(keep, drop)`` vertex pairs for degenerate
+    slivers that cannot be closed by a face.
     """
     loops = _hole_loops(faces)
+    if _DEBUG:
+        nb = sum(1 for e, l in _edge_use(faces).items() if len(l) == 1)
+        print("   [fill] boundary_edges=%d loops=%d sizes=%s"
+              % (nb, len(loops), sorted(len(l) for l in loops)[:40]))
     if not loops:
-        return faces, False
+        return faces, [], [], False
     existing = set(_edge_use(faces))
     added = []
+    new_pts = []
+    welds = []
+    welded = set()
     changed = False
+    skipped = []
     for loop in loops:
         k = len(loop)
-        if k < 3:
+        if k < 3 or len(set(loop)) != k:
+            skipped.append(("repeated", k))
+            continue
+        pts = P[list(loop)]
+        c = np.cross(pts[1] - pts[0], pts[2] - pts[0])
+        if k <= 4 and float(c @ c) < 1e-26:
+            # collinear sliver: no face can close it - weld the closest pair
+            d = pts - np.roll(pts, -1, axis=0)
+            a = int(np.argmin(np.einsum("ij,ij->i", d, d)))
+            u, v = loop[a], loop[(a + 1) % k]
+            keep, drop = (u, v) if u < v else (v, u)
+            if keep not in welded and drop not in welded:
+                welds.append((keep, drop))
+                welded.add(keep)
+                welded.add(drop)
+                changed = True
             continue
         if cbnd is not None and all(
                 v < len(cbnd) and cbnd[v] for v in loop):
+            skipped.append(("boundary", k))
             continue                     # real opening of an open input mesh
         parts = None
-        if k == 3 or k == 4:
+        own = set()
+        for b in range(k):
+            u, v = loop[b], loop[(b + 1) % k]
+            own.add((u, v) if u < v else (v, u))
+        if k in (3, 4):
             parts = [tuple(loop)]
         elif k <= 6:
-            parts = _split_ngon(P, tuple(loop), forbidden=existing)
+            parts = _split_ngon(P, tuple(loop), forbidden=existing, skip=own)
         if parts is None:
-            # centroid fan: touches only the loop's own (single-use) edges
-            pts = P[[v for v in loop if v < len(P)]] if k else None
-            cen = pts.mean(axis=0) if pts is not None and len(pts) else None
-            if cen is None:
-                continue
-            if project is not None:
-                cen = project(cen[None, :])[0]
-            ci = len(P) + len(extra_pts)
-            extra_pts.append(cen)
+            # centroid fan: consumes two boundary edges per quad and only ever
+            # touches edges that currently have a single face, so it can never
+            # produce a non-manifold edge
+            cen = P[list(loop)].mean(axis=0)
+            ci = len(P) + len(new_pts)
+            new_pts.append(cen)
             parts = []
             a = 0
-            while k - a >= 3:
-                parts.append((loop[a], loop[a + 1], loop[a + 2], ci))
+            while a + 2 <= k:
+                parts.append((loop[a], loop[(a + 1) % k],
+                              loop[(a + 2) % k], ci))
                 a += 2
-            if a == k - 2:
-                parts.append((loop[a], loop[a + 1], ci))
-            elif a == k - 1:
-                parts.append((loop[a], loop[0], ci))
-            # k - a == 2 -> the wrap-around quad already closed the fan
-            if a == k - 2:
-                pass
+            if a < k:                    # odd loop -> one closing triangle
+                parts.append((loop[a], loop[(a + 1) % k], ci))
         for part in parts:
             m = len(part)
             for b in range(m):
@@ -827,7 +1066,9 @@ def _fill_holes(P, faces, cbnd, extra_pts, project=None):
                 existing.add((u, v) if u < v else (v, u))
         added.extend(parts)
         changed = True
-    return (faces + added if added else faces), changed
+    if _DEBUG and (skipped or welds):
+        print("   [fill] skipped=%s welds=%s" % (skipped[:40], welds[:20]))
+    return (faces + added if added else faces), new_pts, welds, changed
 
 
 def _remove_doublets(P, faces):
@@ -892,7 +1133,7 @@ def _remove_doublets(P, faces):
     return faces
 
 
-def _merge_tri_pairs(P, faces, min_quality=0.05):
+def _merge_tri_pairs(P, faces, min_quality=-1.0):
     tri = [i for i, f in enumerate(faces) if len(f) == 3]
     if len(tri) < 2:
         return faces
@@ -949,6 +1190,191 @@ def _merge_tri_pairs(P, faces, min_quality=0.05):
         else:
             out.append(f)
     return out
+
+
+def _face_edges(f):
+    k = len(f)
+    return [((f[a], f[(a + 1) % k]) if f[a] < f[(a + 1) % k]
+             else (f[(a + 1) % k], f[a])) for a in range(k)]
+
+
+def _merge_along(f1, f2):
+    """Merge two consistently-wound faces sharing exactly one edge.
+
+    Returns ``(cycle, shared_edge)`` or ``None``.
+    """
+    e1 = set(_face_edges(f1))
+    k1, k2 = len(f1), len(f2)
+    shared = []
+    for a in range(k2):
+        u, v = f2[a], f2[(a + 1) % k2]
+        if ((u, v) if u < v else (v, u)) in e1:
+            shared.append((u, v))
+    if len(shared) != 1:
+        return None
+    b, a = shared[0]                      # f2 traverses b -> a
+    if a not in f1 or b not in f1:
+        return None
+    i = f1.index(a)
+    if f1[(i + 1) % k1] != b:
+        return None
+    j = f2.index(b)
+    if f2[(j + 1) % k2] != a:
+        return None
+    r1 = list(f1[(i + 1) % k1:]) + list(f1[:(i + 1) % k1])
+    r2 = list(f2[(j + 1) % k2:]) + list(f2[:(j + 1) % k2])
+    merged = r1 + r2[1:-1]
+    if len(set(merged)) != len(merged) or len(merged) != k1 + k2 - 2:
+        return None
+    return merged, ((a, b) if a < b else (b, a))
+
+
+def _split_pentagon(P, pent, e_next, edge_set, min_quality=-1.0):
+    """Split a pentagon into quad + triangle so that the triangle carries
+    ``e_next``.  Returns ``(quad, tri, chord)`` or ``None``."""
+    j = -1
+    for a in range(5):
+        u, v = pent[a], pent[(a + 1) % 5]
+        if ((u, v) if u < v else (v, u)) == e_next:
+            j = a
+            break
+    if j < 0:
+        return None
+    opts = []
+    for which in (0, 1):
+        if which == 0:
+            tri = (pent[(j - 1) % 5], pent[j], pent[(j + 1) % 5])
+            quad = (pent[(j + 1) % 5], pent[(j + 2) % 5],
+                    pent[(j + 3) % 5], pent[(j - 1) % 5])
+        else:
+            tri = (pent[j], pent[(j + 1) % 5], pent[(j + 2) % 5])
+            quad = (pent[(j + 2) % 5], pent[(j + 3) % 5],
+                    pent[(j + 4) % 5], pent[j])
+        c0, c1 = tri[0], tri[2]
+        chord = (c0, c1) if c0 < c1 else (c1, c0)
+        if chord in edge_set:
+            continue
+        q = _quad_quality(P, quad)
+        if q < min_quality:
+            continue
+        opts.append((q, quad, tri, chord))
+    if not opts:
+        return None
+    opts.sort(key=lambda t: -t[0])
+    return opts[0][1], opts[0][2], opts[0][3]
+
+
+def _bfs_to_tri(start, adj, tri_set, blocked, max_depth):
+    """Shortest face path from ``start`` to another triangle through quads."""
+    prev = {start: None}
+    frontier = [start]
+    for _d in range(max_depth):
+        nxt = []
+        for i in frontier:
+            for j in adj.get(i, ()):
+                if j in prev or j in blocked:
+                    continue
+                prev[j] = i
+                if j in tri_set:
+                    path = [j]
+                    while prev[path[-1]] is not None:
+                        path.append(prev[path[-1]])
+                    return path[::-1]
+                nxt.append(j)
+        if not nxt:
+            return None
+        frontier = nxt
+    return None
+
+
+def _annihilate_triangles(P, faces, max_depth=16, rounds=16,
+                          min_quality=-1.0):
+    """Cancel triangles pairwise.
+
+    A triangle is walked through the quads separating it from another triangle
+    (merge tri+quad -> pentagon, re-split so the triangle lands on the far
+    side); when the two meet they fuse into a quad.  Every step is checked
+    against the existing edge set, so manifoldness is preserved.
+    """
+    faces = [tuple(f) for f in faces]
+    for _r in range(rounds):
+        alive = [f for f in faces if f is not None]
+        if sum(1 for f in alive if len(f) == 3) < 2:
+            break
+        faces = alive
+        use = _edge_use(faces)
+        edge_set = set(use)
+        adj = {}
+        adj_edge = {}
+        for e, fl in use.items():
+            if len(fl) == 2:
+                i, j = fl
+                adj.setdefault(i, []).append(j)
+                adj.setdefault(j, []).append(i)
+                adj_edge[(i, j)] = e
+                adj_edge[(j, i)] = e
+        tri_ids = [i for i, f in enumerate(faces) if len(f) == 3]
+        tri_set = set(tri_ids)
+        blocked = set()
+        progress = False
+        for t0 in tri_ids:
+            if t0 in blocked:
+                continue
+            path = _bfs_to_tri(t0, adj, tri_set - {t0}, blocked, max_depth)
+            if path is None or len(path) < 2:
+                continue
+            pedge = [adj_edge.get((path[i], path[i + 1]))
+                     for i in range(len(path) - 1)]
+            if any(e is None for e in pedge):
+                continue
+            upd = {}
+            cur = path[0]
+            cur_face = faces[cur]
+            eset = set(edge_set)
+            ok = True
+            for si in range(1, len(path) - 1):
+                step = path[si]
+                m = _merge_along(cur_face, faces[step])
+                if m is None:
+                    ok = False
+                    break
+                pent, shared = m
+                if len(pent) != 5:
+                    ok = False
+                    break
+                eset.discard(shared)
+                sp = _split_pentagon(P, pent, pedge[si], eset,
+                                     min_quality)
+                if sp is None:
+                    ok = False
+                    break
+                quad, tri, chord = sp
+                eset.add(chord)
+                upd[cur] = quad
+                upd[step] = tri
+                cur = step
+                cur_face = tri
+            if not ok:
+                continue
+            last = path[-1]
+            m = _merge_along(cur_face, faces[last])
+            if m is None or len(m[0]) != 4:
+                continue
+            quad = tuple(m[0])
+            if _quad_quality(P, quad) < min_quality:
+                continue
+            upd[cur] = quad
+            upd[last] = None
+            for i, v in upd.items():
+                faces[i] = v
+            edge_set = eset
+            edge_set.discard(m[1])
+            blocked.update(path)
+            progress = True
+        faces = [f for f in faces if f is not None]
+        if not progress:
+            break
+    return [f for f in faces if f is not None]
 
 
 # --------------------------------------------------------------------------
@@ -1046,7 +1472,7 @@ class _Projector:
             return np.zeros(0, dtype=np.int64)
         return np.unique(np.concatenate(out))
 
-    def project(self, P, max_move=None):
+    def project(self, P):
         P = np.asarray(P, dtype=np.float64).reshape(-1, 3)
         out = P.copy()
         if len(self.F) == 0 or len(P) == 0:
@@ -1096,14 +1522,6 @@ class _Projector:
                 best = np.argmin(d, axis=1)
                 res = cp.reshape(k, t, 3)[np.arange(k), best]
                 out[sel[c0:c0 + step]] = res
-        if max_move is not None:
-            dv = out - P
-            dl = np.sqrt(np.einsum("ij,ij->i", dv, dv))
-            too_far = dl > max_move
-            if np.isscalar(max_move):
-                out[too_far] = P[too_far]
-            else:
-                out[too_far] = P[too_far]
         return out
 
 
@@ -1111,9 +1529,41 @@ class _Projector:
 # relaxation
 # --------------------------------------------------------------------------
 
-def _relax(P, faces, frozen, projector, rho_v, iters=4, step=0.5):
+def _tri_quad_arrays(faces):
+    tris = np.asarray([f for f in faces if len(f) == 3],
+                      dtype=np.int64).reshape(-1, 3)
+    quads = np.asarray([f for f in faces if len(f) == 4],
+                       dtype=np.int64).reshape(-1, 4)
+    return tris, quads
+
+
+def _vertex_normals_poly(P, tris, quads, n):
+    N = np.zeros((n, 3))
+
+    def _acc(idx, nrm):
+        for k in range(idx.shape[1]):
+            for c in range(3):
+                N[:, c] += np.bincount(idx[:, k], weights=nrm[:, c],
+                                       minlength=n)
+
+    if len(tris):
+        p = P[tris]
+        _acc(tris, np.cross(p[:, 1] - p[:, 0], p[:, 2] - p[:, 0]))
+    if len(quads):
+        p = P[quads]
+        _acc(quads, np.cross(p[:, 2] - p[:, 0], p[:, 3] - p[:, 1]))
+    ln = np.sqrt(np.einsum("ij,ij->i", N, N))
+    bad = ln < 1e-14
+    if bad.any():
+        N[bad] = (0.0, 0.0, 1.0)
+    return normalize(N)
+
+
+def _relax(P, faces, frozen, projector, rho_v, iters=4, step=0.5,
+           uncapped=None):
     if iters <= 0 or len(faces) == 0:
         return P
+    tris, quads = _tri_quad_arrays(faces)
     pairs = []
     for f in faces:
         k = len(f)
@@ -1123,59 +1573,41 @@ def _relax(P, faces, frozen, projector, rho_v, iters=4, step=0.5):
     src = np.concatenate([e[:, 0], e[:, 1]])
     dst = np.concatenate([e[:, 1], e[:, 0]])
     n = len(P)
-    deg = np.bincount(src, minlength=n).astype(np.float64)
-    deg = np.maximum(deg, 1.0)
+    deg = np.maximum(np.bincount(src, minlength=n).astype(np.float64), 1.0)
     P = P.copy()
     move = ~frozen
     if not move.any():
         return P
+    midx = np.nonzero(move)[0]
     for _ in range(iters):
+        Pd = P[dst]
         acc = np.empty((n, 3))
         for c in range(3):
-            acc[:, c] = np.bincount(src, weights=P[dst][:, c], minlength=n)
+            acc[:, c] = np.bincount(src, weights=Pd[:, c], minlength=n)
         acc /= deg[:, None]
         delta = acc - P
-        # tangential component only (uses the current vertex normal estimate)
-        Nv = _vertex_normals_poly(P, faces, n)
+        Nv = _vertex_normals_poly(P, tris, quads, n)
         delta -= Nv * _dot(delta, Nv)[:, None]
-        Pn = P.copy()
-        Pn[move] = P[move] + step * delta[move]
+        cand = P[midx] + step * delta[midx]
         if projector is not None:
-            Pn[move] = projector.project(Pn[move])
-            d = Pn[move] - P[move]
-            dl = np.sqrt(np.einsum("ij,ij->i", d, d))
-            cap = 0.75 * rho_v[move]
-            bad = dl > cap
-            if bad.any():
-                idx = np.nonzero(move)[0][bad]
-                Pn[idx] = P[idx]
+            cand = projector.project(cand)
+        d = cand - P[midx]
+        dl = np.sqrt(np.einsum("ij,ij->i", d, d))
+        good = dl <= 0.75 * rho_v[midx]
+        if uncapped is not None:
+            good |= uncapped[midx]
+        Pn = P.copy()
+        Pn[midx[good]] = cand[good]
         P = Pn
     return P
-
-
-def _vertex_normals_poly(P, faces, n):
-    N = np.zeros((n, 3))
-    for f in faces:
-        p = P[list(f)]
-        k = len(f)
-        nrm = np.zeros(3)
-        for a in range(k):
-            nrm += np.cross(p[a], p[(a + 1) % k])
-        for v in f:
-            N[v] += nrm
-    ln = np.sqrt(np.einsum("ij,ij->i", N, N))
-    bad = ln < 1e-14
-    if bad.any():
-        N[bad] = (0.0, 0.0, 1.0)
-    return normalize(N)
 
 
 # --------------------------------------------------------------------------
 # core
 # --------------------------------------------------------------------------
 
-def _extract_core(O, Q, N, rho, edges, bnd_verts=None, V=None, F=None,
-                  relax_iters=4, projector=None):
+def _extract_core(O, Q, N, rho, edges, bnd_verts=None, relax_iters=4,
+                  projector=None):
     n = O.shape[0]
     edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
     if len(edges) == 0:
@@ -1217,41 +1649,48 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, V=None, F=None,
 
     # ---- hole filling / doublets / tri fusion, to a fixed point ----------
     P = CP
-    extra = []
+    n_new = 0
 
-    def _proj_pt(pt):
-        if projector is None:
-            return pt
-        return projector.project(pt)
+    def _round_trip(P, faces, n_new, do_merge):
+        faces, new_pts, welds, changed = _fill_holes(P, faces, cbnd)
+        for keep, drop in welds:
+            faces = _collapse_vertex(faces, keep, drop)
+        if new_pts:
+            pts = np.asarray(new_pts, dtype=np.float64).reshape(-1, 3)
+            if projector is not None:
+                pts = projector.project(pts)
+            P = np.concatenate([P, pts], axis=0)
+            n_new += len(pts)
+        passes = [("dedupe", lambda fl: _dedupe(P, fl)),
+                  ("isolated", _drop_isolated),
+                  ("manifold", lambda fl: _enforce_edge_manifold(P, fl)),
+                  ("injective", _make_injective),
+                  ("doublets", lambda fl: _remove_doublets(P, fl))]
+        if do_merge:
+            # well-shaped cancellations first, then take what is left
+            passes += [
+                ("tripairs", lambda fl: _merge_tri_pairs(P, fl)),
+                ("annihil_q",
+                 lambda fl: _annihilate_triangles(P, fl, min_quality=0.10)),
+                ("annihil", lambda fl: _annihilate_triangles(P, fl)),
+            ]
+        passes += [("dedupe2", lambda fl: _dedupe(P, fl)),
+                   ("manifold2", lambda fl: _enforce_edge_manifold(P, fl)),
+                   ("injective2", _make_injective)]
+        for tag, fn in passes:
+            faces = fn(faces)
+            if _DEBUG:
+                nb = sum(1 for l in _edge_use(faces).values() if len(l) == 1)
+                nt = sum(1 for f in faces if len(f) == 3)
+                print("   [post] %-10s faces=%d bnd=%d tri=%d"
+                      % (tag, len(faces), nb, nt))
+        return P, faces, n_new, changed
 
-    for _round in range(4):
-        faces, changed = _fill_holes(P, faces, cbnd, extra,
-                                     project=_proj_pt if projector else None)
-        if extra:
-            P = np.concatenate([CP, np.asarray(extra).reshape(-1, 3)], axis=0)
-        faces = _dedupe(P, faces)
-        faces = _enforce_edge_manifold(P, faces)
-        faces = _make_injective(faces)
-        faces = _remove_doublets(P, faces)
-        faces = _dedupe(P, faces)
-        faces = _enforce_edge_manifold(P, faces)
-        if not changed:
+    for _round in range(7):
+        do_merge = (_round in (1, 3))
+        P, faces, n_new, changed = _round_trip(P, faces, n_new, do_merge)
+        if not changed and not do_merge and _round >= 4:
             break
-
-    faces = _merge_tri_pairs(P, faces)
-    faces = _dedupe(P, faces)
-    faces = _enforce_edge_manifold(P, faces)
-    # a fusion can (very rarely) open a hole again
-    faces, changed = _fill_holes(P, faces, cbnd, extra,
-                                 project=_proj_pt if projector else None)
-    if changed:
-        if extra:
-            P = np.concatenate([CP, np.asarray(extra).reshape(-1, 3)], axis=0)
-        faces = _dedupe(P, faces)
-        faces = _enforce_edge_manifold(P, faces)
-    faces = _orient(P, np.concatenate(
-        [CN, np.tile((0.0, 0.0, 1.0), (len(P) - nc, 1))], axis=0)
-        if len(P) > nc else CN, faces)
 
     if not faces:
         return np.zeros((0, 3)), []
@@ -1259,20 +1698,27 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, V=None, F=None,
     # ---- relax + reproject ----------------------------------------------
     npt = len(P)
     if npt > nc:
-        crho_full = np.concatenate([crho, np.full(npt - nc, float(np.mean(crho)))])
-        cbnd_full = np.concatenate([cbnd, np.zeros(npt - nc, dtype=bool)])
+        pad = npt - nc
+        crho_full = np.concatenate([crho, np.full(pad, float(np.mean(crho)))])
+        cbnd_full = np.concatenate([cbnd, np.zeros(pad, dtype=bool)])
     else:
         crho_full = crho
         cbnd_full = cbnd
+    is_new = np.zeros(npt, dtype=bool)
+    if npt > nc:
+        is_new[nc:] = True
     if projector is not None:
         frozen = cbnd_full.copy()
-        P = _relax(P, faces, frozen, projector, crho_full, iters=relax_iters)
-        moved = P.copy()
-        moved[~frozen] = projector.project(P[~frozen])
-        d = moved - P
-        dl = np.sqrt(np.einsum("ij,ij->i", d, d))
-        ok = dl <= 0.75 * crho_full
-        P = np.where(ok[:, None], moved, P)
+        P = _relax(P, faces, frozen, projector, crho_full, iters=relax_iters,
+                   uncapped=is_new)
+        free = np.nonzero(~frozen)[0]
+        if len(free):
+            moved = projector.project(P[free])
+            d = moved - P[free]
+            dl = np.sqrt(np.einsum("ij,ij->i", d, d))
+            ok = (dl <= 0.75 * crho_full[free]) | is_new[free]
+            P = P.copy()
+            P[free[ok]] = moved[ok]
 
     # ---- compact ---------------------------------------------------------
     used = np.zeros(len(P), dtype=bool)
@@ -1291,7 +1737,13 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, V=None, F=None,
 
 def extract_quads(O, Q, N, rho, edges, min_cycle=3, max_cycle=6,
                   bnd_verts=None):
-    """v1 entry point: the caller supplies an already-solved position field."""
+    """v1 entry point: the caller supplies an already-solved position field.
+
+    ``min_cycle`` / ``max_cycle`` are accepted for signature compatibility and
+    ignored - the orbit length limits are now fixed by ``MAX_ORBIT`` and the
+    repair stage.  Surface reprojection is skipped here because this entry
+    point does not receive the input triangles.
+    """
     return _extract_core(O, Q, N, rho, np.asarray(edges), bnd_verts=bnd_verts,
                          projector=None, relax_iters=0)
 
@@ -1301,11 +1753,19 @@ def extract(V, F, sol, params=None):
 
     Solves the position field for the orientation field in ``sol`` and returns
     a repaired quad-dominant mesh ``(VQ (k,3) float64, FQ list[3|4-tuples])``.
+
+    Recognised ``params`` keys: ``target_faces``, ``seed``, ``sharp_edges``,
+    ``preserve_boundaries``, ``pos_iters``, ``relax_iters``, ``attempts``,
+    ``project``.
     """
     p = dict(params or {})
     V = np.ascontiguousarray(np.asarray(V, dtype=np.float64).reshape(-1, 3))
     F = np.ascontiguousarray(np.asarray(F, dtype=np.int64).reshape(-1, 3))
     n = V.shape[0]
+    if n < 4 or len(F) < 2 or F.size == 0:
+        return np.zeros((0, 3)), []
+    if int(F.max()) >= n or int(F.min()) < 0:
+        raise ValueError("triangle indices out of range")
 
     N = np.asarray(_sol_get(sol, "N"), dtype=np.float64).reshape(n, 3)
     Q = np.asarray(_sol_get(sol, "Q"), dtype=np.float64).reshape(n, 3)
@@ -1318,6 +1778,29 @@ def extract(V, F, sol, params=None):
         Q[bad] = _any_tangent(N[bad])
     Q = normalize(Q)
 
+    # ---- make the input resolvable by the lattice -------------------------
+    # Built on the *original* triangles: midpoint refinement does not move the
+    # surface, so the projector stays valid (and cheap).
+    V0, F0 = V, F
+    projector = _Projector(V0, F0) if p.get("project", True) else None
+
+    sharp = p.get("sharp_edges")
+    if sharp is not None and len(sharp):
+        sharp = np.asarray(sharp, dtype=np.int64).reshape(-1, 2)
+        sharp = sharp[(sharp[:, 0] != sharp[:, 1]) & (sharp.min(axis=1) >= 0)
+                      & (sharp.max(axis=1) < n)]
+        sharp = np.sort(sharp, axis=1)
+    else:
+        sharp = None
+
+    if p.get("refine", True):
+        # allow one retry step of rho headroom before the lattice gets finer
+        V, F, N, Q, rho, sharp = _refine_for_lattice(
+            V, F, N, Q, rho * 0.8, sharp,
+            max_verts=int(p.get("max_refine_verts", MAX_REFINE_VERTS)))
+        rho = rho / 0.8
+        n = V.shape[0]
+
     edges = _build_edges(F)
     if len(edges) == 0:
         return np.zeros((0, 3)), []
@@ -1329,9 +1812,8 @@ def extract(V, F, sol, params=None):
     if len(be):
         bnd_verts[be.ravel()] = True
     pin_list = []
-    sharp = p.get("sharp_edges")
     if sharp is not None and len(sharp):
-        pin_list.append(np.asarray(sharp, dtype=np.int64).reshape(-1, 2))
+        pin_list.append(sharp)
     if len(be) and p.get("preserve_boundaries", True):
         pin_list.append(be)
     pin_mask = np.zeros(n, dtype=bool)
@@ -1370,9 +1852,8 @@ def extract(V, F, sol, params=None):
     levels = _build_pos_hierarchy(V, N, Q, rho, indptr, indices,
                                   pin_mask, pin_dir, rng)
     pos_iters = int(p.get("pos_iters", 20) or 20)
-
-    projector = _Projector(V, F) if p.get("project", True) else None
     target = int(p.get("target_faces", 0) or 0)
+    in_area = float(_tri_areas(V0, F0).sum())
 
     best = None
     scale = 1.0
@@ -1380,16 +1861,20 @@ def extract(V, F, sol, params=None):
     for _a in range(max(1, attempts)):
         O = _solve_positions(levels, scale, pos_iters)
         VQ, FQ = _extract_core(O, Q, N, rho * scale, edges,
-                               bnd_verts=bnd_verts, V=V, F=F,
-                               projector=projector,
+                               bnd_verts=bnd_verts, projector=projector,
                                relax_iters=int(p.get("relax_iters", 4)))
         nf = len(FQ)
         nq = sum(1 for f in FQ if len(f) == 4)
+        cover = (_poly_area(VQ, FQ) / in_area) if (nf and in_area > 0) else 0.0
+        # Coverage dominates: a fragmented result that happens to land on the
+        # face target is worthless, so missing surface is penalised hardest.
+        score = 4.0 * max(0.0, 1.0 - cover) - 0.25 * (nq / float(max(nf, 1)))
         if target > 0:
-            score = abs(np.log(max(nf, 1) / float(target))) - 0.25 * (
-                nq / float(max(nf, 1)))
-        else:
-            score = -(nq / float(max(nf, 1)))
+            score += abs(np.log(max(nf, 1) / float(target)))
+        if _DEBUG:
+            print("   [attempt] scale=%.3f faces=%d quad%%=%.1f cover=%.1f%% "
+                  "score=%.3f" % (scale, nf, 100.0 * nq / max(nf, 1),
+                                  100.0 * cover, score))
         if best is None or score < best[0]:
             best = (score, VQ, FQ)
         if target <= 0:
@@ -1398,7 +1883,7 @@ def extract(V, F, sol, params=None):
             scale *= 0.6
             continue
         ratio = nf / float(target)
-        if 0.82 <= ratio <= 1.22:
+        if 0.82 <= ratio <= 1.22 and cover >= 0.95:
             break
         scale *= float(np.clip(np.sqrt(ratio), 0.55, 1.8))
 

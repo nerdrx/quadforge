@@ -579,10 +579,20 @@ def render_wire(obj, path):
     scene = bpy.context.scene
     setup_render(scene)
 
-    bb = np.array([list(c) for c in obj.bound_box], dtype=np.float64)
-    lo, hi = bb.min(axis=0), bb.max(axis=0)
+    # World-space vertices, straight from the mesh: obj.bound_box is lazily
+    # evaluated and is stale right after run_remesh swaps the mesh in, which
+    # silently wrecks the framing.
+    n = len(obj.data.vertices)
+    co = np.empty(n * 3, dtype=np.float64)
+    obj.data.vertices.foreach_get("co", co)
+    co = co.reshape(n, 3)
+    mw = np.array(obj.matrix_world, dtype=np.float64)
+    Vw = co @ mw[:3, :3].T + mw[:3, 3]
+    lo, hi = Vw.min(axis=0), Vw.max(axis=0)
     center = Vector(0.5 * (lo + hi))
     diag = float(np.linalg.norm(hi - lo)) or 1.0
+    bb = np.array([[x, y, z] for x in (lo[0], hi[0])
+                   for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
 
     obj.color = (0.72, 0.73, 0.78, 1.0)
 
@@ -608,7 +618,10 @@ def render_wire(obj, path):
     cam.rotation_euler = (-d).to_track_quat('-Z', 'Y').to_euler()
     scene.camera = cam
 
-    # fit the bbox corners in camera space, then tighten for a close-up
+    # fit the bbox corners in camera space, then tighten for a close-up.
+    # matrix_world is lazily evaluated: without this the camera transform we
+    # just assigned is not visible yet and the framing comes out cropped.
+    bpy.context.view_layer.update()
     mat = cam.matrix_world.inverted()
     ex = ey = 1e-9
     for corner in bb:
@@ -616,7 +629,7 @@ def render_wire(obj, path):
         ex = max(ex, abs(v.x))
         ey = max(ey, abs(v.y))
     aspect = scene.render.resolution_x / float(scene.render.resolution_y)
-    cam_data.ortho_scale = 2.0 * max(ex, ey * aspect) * 0.86
+    cam_data.ortho_scale = 2.0 * max(ex, ey * aspect) * 0.92
 
     scene.render.filepath = path
     try:

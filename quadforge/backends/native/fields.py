@@ -31,6 +31,7 @@ what the standalone self-tests use.
 
 from __future__ import annotations
 
+import time as _time
 from dataclasses import dataclass, field as _dc_field
 
 import numpy as np
@@ -61,6 +62,7 @@ __all__ = [
     "tangent_basis",
     "ring_pairs",
     "smooth_cross_field",
+    "smooth_curvature",
     "alignment_weight",
     "target_edge_lengths",
     "smoothstep",
@@ -652,13 +654,26 @@ def ring_pairs(indptr, indices, n, min_valence=5):
 
 @dataclass
 class CurvatureField:
-    """Per-vertex principal curvature estimate."""
+    """Per-vertex principal curvature estimate.
+
+    The shape operator is stored twice: as the principal pair
+    ``(k1, D1) / (k2, D2)`` and as the equivalent *isotropic + deviatoric*
+    split ``km = (k1+k2)/2`` (mean curvature, a scalar) and ``kd =
+    |k1-k2|/2`` with direction ``D1`` (a spin-2 / line quantity).  The split
+    is what :func:`smooth_curvature` averages, because only there does noise
+    actually cancel.
+    """
     k1: np.ndarray          # (n,) larger principal curvature
     k2: np.ndarray          # (n,) smaller principal curvature
     D1: np.ndarray          # (n,3) unit direction of k1 (tangent)
     D2: np.ndarray          # (n,3) unit direction of k2 = N x D1
     aniso: np.ndarray       # (n,) |k1-k2| / (|k1|+|k2|+eps)  in [0,1]
     conf: np.ndarray        # (n,) magnitude confidence in [0,1]
+    km: np.ndarray = None   # (n,) mean curvature (k1+k2)/2
+    kd: np.ndarray = None   # (n,) deviatoric magnitude |k1-k2|/2
+    e1: np.ndarray = None   # (n,3) tangent frame used for the fit
+    e2: np.ndarray = None   # (n,3)
+    edge_len: np.ndarray = None   # (n,) mean incident edge length
 
 
 def principal_curvatures(V, F=None, N=None, indptr=None, indices=None,
@@ -698,7 +713,8 @@ def principal_curvatures(V, F=None, N=None, indptr=None, indices=None,
     if len(si) == 0:
         z = np.zeros(n)
         return CurvatureField(z, z.copy(), e1.copy(), e2.copy(),
-                              z.copy(), z.copy())
+                              z.copy(), z.copy(), km=z.copy(), kd=z.copy(),
+                              e1=e1, e2=e2, edge_len=np.ones(n))
 
     d = V[di] - V[si]
     L = np.sqrt(np.einsum("ij,ij->i", d, d))
@@ -710,7 +726,8 @@ def principal_curvatures(V, F=None, N=None, indptr=None, indices=None,
     if not ok.any():
         z = np.zeros(n)
         return CurvatureField(z, z.copy(), e1.copy(), e2.copy(),
-                              z.copy(), z.copy())
+                              z.copy(), z.copy(), km=z.copy(), kd=z.copy(),
+                              e1=e1, e2=e2, edge_len=np.ones(n))
     si, di = si[ok], di[ok]
     d, L, tl = d[ok], L[ok], tl[ok]
     NI = NI[ok]
@@ -764,43 +781,114 @@ def principal_curvatures(V, F=None, N=None, indptr=None, indices=None,
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
     a, b, c = X[:, 0], X[:, 1], X[:, 2]
-    half = 0.5 * (a + c)
-    disc = np.sqrt(np.maximum(0.25 * (a - c) ** 2 + b * b, 0.0))
-    k1 = half + disc
-    k2 = half - disc
+    km = 0.5 * (a + c)                                    # isotropic part
+    kd = np.sqrt(np.maximum(0.25 * (a - c) ** 2 + b * b, 0.0))   # deviatoric
     theta = 0.5 * np.arctan2(2.0 * b, a - c)
     D1 = e1 * np.cos(theta)[:, None] + e2 * np.sin(theta)[:, None]
+
+    el = np.bincount(si, weights=L, minlength=n) / np.maximum(
+        np.bincount(si, minlength=n), 1).astype(np.float64)
+    el[el <= 0.0] = float(np.mean(L))
+    return _finish_curvature(km, kd, D1, N, e1, e2, el)
+
+
+def _finish_curvature(km, kd, D1, N, e1, e2, edge_len):
+    """(mean, deviatoric, direction) -> a complete :class:`CurvatureField`."""
     D1 = D1 - N * _dot(D1, N)[:, None]
     dl = np.sqrt(np.einsum("ij,ij->i", D1, D1))
     bad = dl < 1e-9
     if bad.any():
+        D1 = D1.copy()
         D1[bad] = e1[bad]
     D1 = normalize(D1)
     D2 = normalize(np.cross(N, D1))
+    k1 = km + kd
+    k2 = km - kd
 
-    ksum = np.abs(k1) + np.abs(k2)
-    # scale-aware floor: 0.1% of the mesh's typical curvature magnitude, so
-    # that flat regions (where k1 ~ k2 ~ numerical noise) report aniso ~ 0
-    # instead of a random 1.0
-    ref = float(np.percentile(ksum, 75.0)) if n else 0.0
-    aniso = np.abs(k1 - k2) / (ksum + max(ref * 1e-3, EPS))
-    aniso = np.clip(np.nan_to_num(aniso), 0.0, 1.0)
+    # |k1-k2| / (|k1|+|k2|) reduces exactly to kd / max(|km|, kd)
+    denom = np.maximum(np.abs(km), kd)
+    ref = float(np.percentile(denom, 75.0)) if len(denom) else 0.0
+    aniso = np.clip(kd / (denom + max(ref * 1e-3, EPS)), 0.0, 1.0)
+    aniso = np.nan_to_num(aniso)
 
     # magnitude confidence: curvature * local edge length is the turning angle
-    # per edge; below ~0.5 degrees per edge the direction is noise.
-    el = np.bincount(si, weights=L, minlength=n) / np.maximum(
-        np.bincount(si, minlength=n), 1).astype(np.float64)
-    turn = np.maximum(np.abs(k1), np.abs(k2)) * el
+    # per edge; below ~0.5 degrees per edge the direction is numerical noise.
+    turn = np.maximum(np.abs(k1), np.abs(k2)) * edge_len
     conf = smoothstep(turn, 0.008, 0.04)
-    return CurvatureField(k1, k2, D1, D2, aniso, conf)
+    return CurvatureField(k1, k2, D1, D2, aniso, conf,
+                          km=km, kd=kd, e1=e1, e2=e2, edge_len=edge_len)
+
+
+def smooth_curvature(cur, N, src, dst, iters=4, self_weight=1.0):
+    """Diffuse the *shape operator* (not just its direction) over the 1-ring.
+
+    A symmetric 2x2 tensor splits into a scalar mean curvature ``km`` and a
+    spin-2 deviatoric part of magnitude ``kd`` pointing along ``D1``.  Under a
+    rotation by ``phi`` the deviatoric part rotates by ``2*phi``, so averaging
+    it over the neighbourhood is exactly averaging the tensors - and that is
+    the point: on a *noisy* surface the deviatoric parts of neighbouring
+    vertices point in unrelated directions and **cancel**, which shrinks
+    ``kd`` and therefore the anisotropy, so the alignment weight backs off on
+    its own.  Smoothing unit directions instead (the obvious thing to do)
+    renormalises noise back up to full strength and actively harms the field.
+
+    ``iters`` Jacobi sweeps diffuse over a radius of roughly
+    ``sqrt(iters) * edge_length``; :func:`solve_fields` picks it from the
+    target edge length so the field only chases detail the quads can carry.
+    """
+    if iters <= 0:
+        return cur
+    n = len(N)
+    km = np.array(cur.km, dtype=np.float64, copy=True)
+    kd = np.array(cur.kd, dtype=np.float64, copy=True)
+    D1 = np.array(cur.D1, dtype=np.float64, copy=True)
+    e1, e2 = cur.e1, cur.e2
+    deg = np.bincount(src, minlength=n).astype(np.float64)
+    denom = deg + float(self_weight)
+
+    for _ in range(int(iters)):
+        # express the neighbour's principal direction in the frame of `src`
+        p = D1[dst] - N[src] * _dot(D1[dst], N[src])[:, None]
+        cc = _dot(p, e1[src])
+        ss = _dot(p, e2[src])
+        nn = cc * cc + ss * ss
+        w = kd[dst] / np.maximum(nn, EPS)
+        zx = w * (cc * cc - ss * ss)          # kd * cos(2 theta)
+        zy = w * (2.0 * cc * ss)              # kd * sin(2 theta)
+
+        Zx = np.bincount(src, weights=zx, minlength=n)
+        Zy = np.bincount(src, weights=zy, minlength=n)
+        Hs = np.bincount(src, weights=km[dst], minlength=n)
+
+        # own contribution, in its own frame
+        c0 = _dot(D1, e1)
+        s0 = _dot(D1, e2)
+        n0 = np.maximum(c0 * c0 + s0 * s0, EPS)
+        Zx += self_weight * kd * (c0 * c0 - s0 * s0) / n0
+        Zy += self_weight * kd * (2.0 * c0 * s0) / n0
+        Hs += self_weight * km
+
+        Zx /= denom
+        Zy /= denom
+        km = Hs / denom
+        kd = np.sqrt(Zx * Zx + Zy * Zy)
+        th = 0.5 * np.arctan2(Zy, Zx)
+        D1 = e1 * np.cos(th)[:, None] + e2 * np.sin(th)[:, None]
+
+    return _finish_curvature(km, kd, D1, N, e1, e2, cur.edge_len)
 
 
 def smooth_cross_field(D, W, N, src, dst, iters=3):
-    """Weighted 4-RoSy smoothing of a *target* cross field.
+    """Weighted 4-RoSy smoothing of a *target* cross field (directions only).
 
     Unlike :func:`smooth_orientations` this keeps the per-vertex weights fixed
-    and only cleans up the directions, so a few noisy high-anisotropy vertices
-    cannot drag the alignment target away from the surrounding flow.
+    and only cleans up the directions.
+
+    Note that :func:`solve_fields` deliberately does **not** use this on the
+    curvature target: smoothing unit directions renormalises noise back to
+    full strength.  :func:`smooth_curvature` diffuses the shape operator
+    itself, where noise cancels.  This helper stays for callers that already
+    have a direction field with no magnitude attached (e.g. guide fields).
     """
     n = D.shape[0]
     D = np.array(D, dtype=np.float64, copy=True)
@@ -908,7 +996,8 @@ FIELD_DEFAULTS = {
     "curvature_align": 0.7,
     "seed": 0,
     "orient_iters": 20,
-    "curvature_smooth": 4,
+    "curvature_smooth": "auto",   # int, or "auto" = derive from rho
+    "curvature_scale": 0.6,       # smoothing radius as a fraction of rho
     "min_valence": 5,
     "preserve_boundaries": True,
     "verbose": False,
@@ -972,14 +1061,14 @@ def solve_fields(V, F, params=None):
 
     Returns a :class:`FieldSolution`.  Deterministic for a given seed.
     """
-    import time as _time
     t0 = _time.time()
     p = dict(FIELD_DEFAULTS)
     for k, v in (params or {}).items():
         if v is not None or k not in p:
             p[k] = v
     for k in ("target_faces", "orient_iters", "seed", "adaptive",
-              "curvature_align", "curvature_smooth", "min_valence"):
+              "curvature_align", "curvature_smooth", "curvature_scale",
+              "min_valence"):
         if p.get(k) is None:
             p[k] = FIELD_DEFAULTS[k]
 
@@ -1009,12 +1098,23 @@ def solve_fields(V, F, params=None):
     ca = float(np.clip(ca, 0.0, 1.0))
     cur = principal_curvatures(V, F, N=N, indptr=indptr, indices=indices,
                                min_valence=int(p["min_valence"]))
+
+    # Curvature is only useful at the scale the output quads can represent, so
+    # diffuse the shape operator over a radius of ~curvature_scale * rho.  A
+    # Jacobi sweep spreads about one edge length, radius grows as sqrt(iters).
+    rho0 = np.sqrt(max(float(np.sum(areas)), EPS)
+                   / max(12.0, float(p["target_faces"])))
+    mean_edge = float(np.mean(cur.edge_len))
+    csm = p.get("curvature_smooth")
+    if csm is None or csm == "auto":
+        radius = float(p.get("curvature_scale", 0.6)) * rho0
+        csm = int(np.clip(round((radius / max(mean_edge, EPS)) ** 2), 6, 24))
+    csm = int(csm)
+    src_all = np.repeat(np.arange(n, dtype=np.int64), np.diff(indptr))
+    if ca > 0.0 and csm > 0:
+        cur = smooth_curvature(cur, N, src_all, indices, iters=csm)
     align_w = alignment_weight(cur, ca)
     align_dir = cur.D1
-    if ca > 0.0:
-        src_all = np.repeat(np.arange(n, dtype=np.int64), np.diff(indptr))
-        align_dir = smooth_cross_field(cur.D1, align_w, N, src_all, indices,
-                                       iters=int(p["curvature_smooth"]))
     t_curv = _time.time()
 
     # ---- constraints (sharp edges + boundary + guides) -------------------
@@ -1087,7 +1187,7 @@ def solve_fields(V, F, params=None):
 
     stats = {
         "n": n, "tris": int(len(F)), "levels": len(levels),
-        "curvature_align": ca, "adaptive": adaptive,
+        "curvature_align": ca, "adaptive": adaptive, "curvature_smooth": csm,
         "aligned_verts": int(np.count_nonzero(align_w > 0.05)),
         "t_topology": t_topo - t0, "t_curvature": t_curv - t_topo,
         "t_hierarchy": t_hier - t_curv, "t_orient": t_orient - t_hier,

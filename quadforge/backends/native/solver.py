@@ -200,6 +200,37 @@ def solve(V, F, params=None):
             V, F, sharp_in, dens_in, guide_in)
     n = V.shape[0]
 
+    # ---- v2 path: curvature-aligned fields + robust extraction ----------
+    # (falls back to the v1 pipeline below on any failure)
+    if bool(p.get("use_v2", True)):
+        try:
+            from . import fields as _f2
+            from . import extract as _e2
+            p2 = dict(p)
+            p2["sharp_edges"] = sharp_in
+            p2["density"] = dens_in
+            p2["guide_dirs"] = guide_in
+            p2.setdefault("curvature_align", 0.7)
+            sol = _f2.solve_fields(V, F, p2)
+            VQ, FQ = _e2.extract(V, F, sol, p2)
+            # accept only a result that plausibly covers the input surface:
+            # a collapsed extraction (fragments of the input) must fall back
+            if len(FQ) >= max(4, 0.3 * target):
+                VQa = np.asarray(VQ, dtype=np.float64)
+                _, in_areas = _f.face_normals_areas(V, F)
+                out_area = 0.0
+                for f in FQ:
+                    pts = VQa[list(f)]
+                    for i in range(1, len(pts) - 1):
+                        out_area += 0.5 * np.linalg.norm(
+                            np.cross(pts[i] - pts[0], pts[i + 1] - pts[0]))
+                if out_area >= 0.6 * float(in_areas.sum()):
+                    return VQa, list(FQ)
+        except Exception:
+            if bool(p.get("v2_strict", False)):
+                raise
+            # fall through to v1
+
     # ---- topology ----------------------------------------------------
     N = _f.vertex_normals(V, F)
     edges = _f.build_edges(F)
