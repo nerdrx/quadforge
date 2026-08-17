@@ -162,6 +162,10 @@ class VIEW3D_PT_quadforge(bpy.types.Panel):
         col.prop(s, "backend")
         col.prop(s, "seed")
         col.prop(s, "solver_isolation")
+        col.prop(s, "preserve_small_shells")
+        sub = col.column()
+        sub.active = s.preserve_small_shells
+        sub.prop(s, "small_shell_limit")
 
         col.separator()
         col.prop(s, "lod_targets", text="LODs")

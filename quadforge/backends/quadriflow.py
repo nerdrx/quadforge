@@ -476,21 +476,41 @@ def _solve(context, work_obj, s, stats, **params):
     total_target = int(kwargs["target_faces"])
 
     parts = _separate_loose(context, work_obj)
+
+    # Small separate shells (hair strands, feathers, piercings, teeth) are
+    # usually hand-authored and far below the solver's useful resolution —
+    # remeshing turns them into blobs. Keep them verbatim unless disabled.
+    preserved = []
+    if bool(getattr(s, "preserve_small_shells", True)) and len(parts) > 1:
+        limit = int(getattr(s, "small_shell_limit", 0) or 0)
+        if limit <= 0:
+            total_in = sum(len(p.data.polygons) for p in parts)
+            limit = max(64, int(0.02 * total_in))
+        biggest = max(parts, key=lambda p: len(p.data.polygons))
+        preserved = [p for p in parts
+                     if p is not biggest and len(p.data.polygons) < limit]
+        if preserved:
+            stats["preserved_shells"] = len(preserved)
+            stats["preserved_shell_faces"] = sum(
+                len(p.data.polygons) for p in preserved)
+    solve_parts = [p for p in parts if p not in preserved]
+
     # per-part autoscale: a tiny shell (whiskers, claws) can sit far below
     # QuadriFlow's absolute edge epsilon even after the global autoscale
     base_scale = {}
-    for p in parts:
+    for p in solve_parts:
         f = _autoscale_factor(p.data)
         if f != 1.0:
             _scale_mesh(p.data, f)
         base_scale[p.name] = f
-    big_part = max(parts, key=lambda p: len(p.data.polygons))
-    big_backup = big_part.data.copy() if len(parts) > 1 else None
+    big_part = max(solve_parts, key=lambda p: len(p.data.polygons)) if solve_parts else None
+    big_backup = (big_part.data.copy()
+                  if big_part is not None and len(solve_parts) > 1 else None)
     try:
-        areas = {p.name: _mesh_area(p.data) for p in parts}
+        areas = {p.name: _mesh_area(p.data) for p in solve_parts}
         total_area = sum(areas.values()) or 1.0
         per_part = {}
-        for p in parts:
+        for p in solve_parts:
             k = dict(kwargs)
             # below ~24 faces QuadriFlow cancels instead of solving
             k["target_faces"] = int(max(24, round(total_target * areas[p.name] / total_area)))
@@ -506,7 +526,7 @@ def _solve(context, work_obj, s, stats, **params):
         # (mesh rescale, target jitter, seed jitter) — each retry round changes
         # the solver's discretization completely, the most reliable stall escape
         plans = ((1.0, 1.0, 0), (1.31, 1.09, 977), (0.77, 0.93, 3251), (1.73, 1.17, 7919))
-        remaining = list(parts)
+        remaining = list(solve_parts)
         fail_counts = {}
         gave_up = []
         for round_i, (rescale, t_jitter, s_jitter) in enumerate(plans):
@@ -624,7 +644,7 @@ def _solve(context, work_obj, s, stats, **params):
                 bpy.data.meshes.remove(big_backup)
             except Exception:
                 pass
-        for p in parts:
+        for p in solve_parts:
             f = base_scale.get(p.name, 1.0)
             if f != 1.0:
                 _scale_mesh(p.data, 1.0 / f)

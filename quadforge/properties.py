@@ -111,6 +111,21 @@ class QF_Settings(bpy.types.PropertyGroup):
         default='QUADRIFLOW',
     )
     seed: IntProperty(name="Seed", default=0, min=0)
+    preserve_small_shells: BoolProperty(
+        name="Keep Small Shells",
+        description="Leave small separate shells (hair strands, feathers, "
+                    "piercings, teeth) at their original topology instead of "
+                    "remeshing them into blobs — they are usually already "
+                    "hand-authored and below the solver's useful resolution",
+        default=True,
+    )
+    small_shell_limit: IntProperty(
+        name="Small Shell Limit",
+        description="Shells with fewer input faces than this keep their "
+                    "original topology (0 = automatic: 2% of the input face "
+                    "count, at least 64)",
+        default=0, min=0, soft_max=5000,
+    )
     solver_isolation: BoolProperty(
         name="Hang-Safe Solver",
         description="Run QuadriFlow in a separate Blender process with a timeout "
