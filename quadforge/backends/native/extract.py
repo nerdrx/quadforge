@@ -124,6 +124,16 @@ REGULARIZE_TOL = 6e-4
 # escalate triangle-annihilation walk length only below this quad ratio
 QUAD_FLOOR = 0.975
 
+# Feature-curve fairing.  Pinned crease/boundary chains are smoothed ALONG
+# their own polyline and snapped back onto the input feature curve; a
+# junction or a turn sharper than this is a genuine corner and is held.
+FEATURE_CORNER_DEG = 120.0
+FEATURE_STEP = 0.5
+FEATURE_MAX_DRIFT = 0.6
+FEATURE_MIN_SEGS = 3
+FEATURE_MIN_LEN = 2.0
+FEATURE_CORNER_SPAN = 3
+
 __all__ = ["extract", "extract_quads", "make_solution"]
 
 
@@ -229,6 +239,68 @@ def _edge_lookup(e, n):
         pos = np.searchsorted(skey, lo * np.int64(n) + hi)
         return order[np.clip(pos, 0, len(skey) - 1)]
     return eid
+
+
+def _feature_corners(V, segs, n, fdeg, corner_deg=120.0, span=3):
+    """Genuine corners of a feature polyline.
+
+    The turn is measured over a ``span``-segment baseline on each side, not
+    between adjacent segments: a crease traced across a sculpt's triangulation
+    zig-zags, and an adjacent-segment test reads that tessellation noise as a
+    corner on every second vertex (154 of 404 on the Dinasty head), which
+    freezes the chain solid.
+    """
+    corner = fdeg != 2
+    adj = {}
+    for a, b in segs:
+        adj.setdefault(int(a), []).append(int(b))
+        adj.setdefault(int(b), []).append(int(a))
+
+    def walk(v, first):
+        prev, cur = v, first
+        for _ in range(span - 1):
+            nxt = [w for w in adj.get(cur, ()) if w != prev]
+            if len(nxt) != 1:
+                break
+            prev, cur = cur, nxt[0]
+        return cur
+
+    lim = np.cos(np.radians(180.0 - corner_deg))
+    for v, nbv in adj.items():
+        if len(nbv) != 2:
+            continue
+        a = walk(v, nbv[0])
+        b = walk(v, nbv[1])
+        e0 = V[a] - V[v]
+        e1 = V[b] - V[v]
+        l0 = float(np.linalg.norm(e0))
+        l1 = float(np.linalg.norm(e1))
+        if l0 < 1e-15 or l1 < 1e-15:
+            continue
+        # straight run -> e0 and e1 are opposite -> cos = -1
+        if float(e0 @ e1) / (l0 * l1) > -lim:
+            corner[v] = True
+    return corner
+
+
+def _filter_feature_fragments(V, segs, rho, min_segs=FEATURE_MIN_SEGS,
+                              min_len=FEATURE_MIN_LEN):
+    """Drop feature components too small to be a real crease."""
+    segs = np.asarray(segs, dtype=np.int64).reshape(-1, 2)
+    if not len(segs):
+        return segs
+    roots = _union_find(len(V), segs)
+    comp = roots[segs[:, 0]]
+    uniq, inv = np.unique(comp, return_inverse=True)
+    cnt = np.bincount(inv, minlength=len(uniq))
+    L = np.linalg.norm(V[segs[:, 1]] - V[segs[:, 0]], axis=1)
+    tot = np.bincount(inv, weights=L, minlength=len(uniq))
+    keep = (cnt >= min_segs) & (tot >= min_len * max(rho, EPS))
+    out = segs[keep[inv]]
+    if _DEBUG:
+        print("   [feat] components=%d kept=%d segments %d -> %d"
+              % (len(uniq), int(keep.sum()), len(segs), len(out)))
+    return out
 
 
 def _clamp_rho_per_shell(V, F, rho, edges, min_quads=MIN_SHELL_QUADS):
@@ -568,7 +640,7 @@ def _prune_low_degree(nv, e0, e1, min_deg=2):
     return alive, keep
 
 
-def _collapse(O, Q, N, rho, edges):
+def _collapse(O, Q, N, rho, edges, pin=None):
     """Input graph -> extracted lattice graph.
 
     Returns ``(cluster, CP, CN, CQ, ce)``: the input-vertex -> extracted-vertex
@@ -609,6 +681,20 @@ def _collapse(O, Q, N, rho, edges):
         CP[:, c] = np.bincount(cluster, weights=O[:, c], minlength=nc)
         CN[:, c] = np.bincount(cluster, weights=N[:, c], minlength=nc)
     CP /= cnt[:, None]
+    if pin is not None and np.any(pin):
+        # A cluster that contains crease/boundary samples must sit on the
+        # feature, not halfway between it and the neighbouring surface
+        # samples - plain averaging is what stair-steps a sharp rim.
+        w = np.asarray(pin, dtype=np.float64)
+        wsum = np.bincount(cluster, weights=w, minlength=nc)
+        keep = wsum > 0.0
+        if keep.any():
+            CPp = np.empty((nc, 3))
+            for c in range(3):
+                CPp[:, c] = np.bincount(cluster, weights=O[:, c] * w,
+                                        minlength=nc)
+            CPp[keep] /= wsum[keep][:, None]
+            CP = np.where(keep[:, None], CPp, CP)
     ln = np.sqrt(np.einsum("ij,ij->i", CN, CN))
     bad = ln < 1e-12
     if bad.any():
@@ -1485,8 +1571,22 @@ def _closest_on_tri(P, A, B, C):
     return res
 
 
+def _closest_on_seg(P, A, B):
+    """Closest point on each segment (A, B)."""
+    AB = B - A
+    denom = np.einsum("ij,ij->i", AB, AB)
+    t = np.einsum("ij,ij->i", P - A, AB) / np.where(denom < 1e-30, 1.0, denom)
+    t = np.clip(np.where(denom < 1e-30, 0.0, t), 0.0, 1.0)
+    return A + AB * t[:, None]
+
+
 class _Projector:
-    """Nearest point on a triangle mesh via a uniform grid.
+    """Nearest point on a triangle mesh - or a segment soup - via a uniform grid.
+
+    ``prim`` is (m,3) triangles or (m,2) segments.  Segments are NOT expressible
+    as degenerate triangles: with ``B == C`` the barycentric region test for
+    edge BC is satisfied unconditionally and every query would snap to an
+    endpoint, so they get their own closest-point routine.
 
     Fully batched: one ragged gather builds every (query, candidate triangle)
     pair, then a single ``_closest_on_tri`` call and a segment-min pick the
@@ -1499,14 +1599,16 @@ class _Projector:
     def __init__(self, V, F, max_dims=512):
         self.V = np.ascontiguousarray(V, dtype=np.float64)
         self.F = np.ascontiguousarray(F, dtype=np.int64)
+        self.k = self.F.shape[1] if self.F.ndim == 2 and len(self.F) else 3
         self.lo = self.V.min(axis=0)
         ext = np.maximum(self.V.max(axis=0) - self.lo, 1e-12)
         self.diag = float(np.linalg.norm(ext))
         if len(F):
             tri = self.V[self.F]
+            roll = list(range(1, self.k)) + [0]
             # median, not mean: sculpts mix 5x size ranges and the mean would
             # leave hundreds of tiny triangles in every dense cell
-            elen = np.median(np.linalg.norm(tri[:, [1, 2, 0]] - tri, axis=2))
+            elen = np.median(np.linalg.norm(tri[:, roll] - tri, axis=2))
         else:
             elen = self.diag
         cell = max(1.5 * float(elen), self.diag / float(max_dims))
@@ -1521,9 +1623,9 @@ class _Projector:
             return
         # every triangle is registered in the cells of its corners + centroid
         cen = self.V[self.F].mean(axis=1)
-        pts = np.concatenate([self.V[self.F[:, 0]], self.V[self.F[:, 1]],
-                              self.V[self.F[:, 2]], cen], axis=0)
-        tid = np.tile(np.arange(len(F), dtype=np.int64), 4)
+        pts = np.concatenate([self.V[self.F[:, c]] for c in range(self.k)]
+                             + [cen], axis=0)
+        tid = np.tile(np.arange(len(F), dtype=np.int64), self.k + 1)
         key = self._key(self._cell_of(pts))
         order = np.argsort(key, kind="stable")
         self.tri_sorted = tid[order]
@@ -1567,8 +1669,12 @@ class _Projector:
     def _solve(self, P, pt_idx, tri_idx, out, best):
         """Segment-min over the candidate pairs; keeps the running best."""
         tri = self.F[tri_idx]
-        cp = _closest_on_tri(P[pt_idx], self.V[tri[:, 0]], self.V[tri[:, 1]],
-                             self.V[tri[:, 2]])
+        if self.k == 2:
+            cp = _closest_on_seg(P[pt_idx], self.V[tri[:, 0]],
+                                 self.V[tri[:, 1]])
+        else:
+            cp = _closest_on_tri(P[pt_idx], self.V[tri[:, 0]],
+                                 self.V[tri[:, 1]], self.V[tri[:, 2]])
         d = cp - P[pt_idx]
         d2 = np.einsum("ij,ij->i", d, d)
         order = np.lexsort((d2, pt_idx))
@@ -1654,6 +1760,70 @@ def _vertex_normals_poly(P, tris, quads, n):
     return normalize(N)
 
 
+def _build_chains(faces, pinned, P, corner_pts, rho_v):
+    """Feature chains through the pinned output vertices.
+
+    Returns ``(nb (n,2) int64, move (n,) bool, snap_idx, snap_pos)``.  A pinned
+    vertex is faired only when it has exactly two pinned neighbours - a
+    junction cannot slide anywhere sensible.  Each corner of the input feature
+    curve is *anchored*: the nearest pinned vertex is moved exactly onto it and
+    held, which both keeps the corner sharp and gives the movable run between
+    two anchors a clean, correctly-placed endpoint to straighten against.
+    """
+    n = len(P)
+    nb = np.full((n, 2), -1, dtype=np.int64)
+    move = np.zeros(n, dtype=bool)
+    empty = (np.zeros(0, dtype=np.int64), np.zeros((0, 3)))
+    if not np.any(pinned):
+        return nb, move, *empty
+    adj = {}
+    seen = set()
+    for f in faces:
+        k = len(f)
+        for i in range(k):
+            a, b = f[i], f[(i + 1) % k]
+            if not (pinned[a] and pinned[b]):
+                continue
+            e = (a, b) if a < b else (b, a)
+            if e in seen:
+                continue
+            seen.add(e)
+            adj.setdefault(a, []).append(b)
+            adj.setdefault(b, []).append(a)
+    cand = np.array(sorted(v for v, l in adj.items() if len(l) == 2),
+                    dtype=np.int64)
+    if len(cand):
+        for v in cand:
+            nb[v] = adj[int(v)]
+        move[cand] = True
+
+    snap_idx = np.zeros(0, dtype=np.int64)
+    snap_pos = np.zeros((0, 3))
+    if corner_pts is not None and len(corner_pts):
+        pv = np.array(sorted(adj), dtype=np.int64)
+        if len(pv):
+            cp = np.asarray(corner_pts, dtype=np.float64)
+            # nearest pinned output vertex per corner (deterministic ties)
+            best = np.full(len(cp), -1, dtype=np.int64)
+            bd = np.full(len(cp), np.inf)
+            step = max(1, int(4_000_000 // max(len(pv), 1)))
+            for a in range(0, len(cp), step):
+                blk = cp[a:a + step]
+                d = np.linalg.norm(blk[:, None, :] - P[pv][None, :, :], axis=2)
+                j = np.argmin(d, axis=1)
+                best[a:a + step] = pv[j]
+                bd[a:a + step] = d[np.arange(len(blk)), j]
+            order = np.lexsort((bd, best))
+            keep = np.ones(len(order), dtype=bool)
+            bs = best[order]
+            keep[1:] = bs[1:] != bs[:-1]          # one corner per vertex
+            sel = order[keep]
+            snap_idx = best[sel]
+            snap_pos = cp[sel]
+            move[snap_idx] = False
+    return nb, move, snap_idx, snap_pos
+
+
 def _square_targets(P, quads, n, rest=None, size_lock=0.0):
     """Per-vertex target from each quad's best-fit square.
 
@@ -1714,7 +1884,9 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
                 step=REGULARIZE_STEP, max_drift=MAX_DRIFT,
                 size_lock=SIZE_LOCK, rest_smooth=REST_SMOOTH,
                 rest_rho=REST_RHO, project_every=PROJECT_EVERY,
-                tol=REGULARIZE_TOL, uncapped=None):
+                tol=REGULARIZE_TOL, uncapped=None, chain_nb=None,
+                chain_move=None, feat_proj=None, chain_step=FEATURE_STEP,
+                chain_drift=FEATURE_MAX_DRIFT, sym_axes=None):
     """Quad fairing: even edge lengths + square corners, on the surface.
 
     Each iteration blends three tangential pulls - a best-fit-square target
@@ -1745,6 +1917,8 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
     if not move.any():
         return P
     midx = np.nonzero(move)[0]
+    cidx = (np.nonzero(chain_move)[0] if chain_move is not None
+            else np.zeros(0, dtype=np.int64))
     drift_cap = max_drift * rho_v
     step_cap = step * 1.5 * rho_v
 
@@ -1818,6 +1992,31 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
                 cand[over] = projector.project(cand[over])
         Pn = P.copy()
         Pn[midx] = cand
+        if len(cidx):
+            # 1D umbrella ALONG the feature polyline, then snap back onto the
+            # true input curve so the feature can never drift off it.  Without
+            # this the chains keep the raw extraction jitter and a thin rim
+            # (an ear border) reads as saw teeth on the silhouette.
+            tgt = 0.5 * (P[chain_nb[cidx, 0]] + P[chain_nb[cidx, 1]])
+            cc = P[cidx] + chain_step * (tgt - P[cidx])
+            if feat_proj is not None:
+                cc = feat_proj.project(cc)
+            dr = cc - P0[cidx]
+            drl = np.sqrt(np.einsum("ij,ij->i", dr, dr))
+            capc = chain_drift * rho_v[cidx]
+            over = drl > capc
+            if over.any():
+                fac = (capc[over] / np.maximum(drl[over], 1e-18))[:, None]
+                cc[over] = P0[cidx[over]] + dr[over] * fac
+                if feat_proj is not None:
+                    cc[over] = feat_proj.project(cc[over])
+            if sym_axes:
+                # a vertex the bisect put on a mirror plane must stay on it
+                for ax, tolp in sym_axes:
+                    on = np.abs(P0[cidx][:, ax]) <= tolp
+                    if on.any():
+                        cc[on, ax] = 0.0
+            Pn[cidx] = cc
         shift = np.abs(cand - P[midx]).max(axis=1) / np.maximum(rho_v[midx], EPS)
         P = Pn
         if do_proj and float(shift.max()) < tol:
@@ -1830,13 +2029,21 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
 # --------------------------------------------------------------------------
 
 def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
-                  pin_verts=None, reg=None, quad_floor=QUAD_FLOOR):
+                  pin_verts=None, reg=None, quad_floor=QUAD_FLOOR,
+                  feat_proj=None, corner_pts=None, sym_axes=None):
     n = O.shape[0]
     edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
     if len(edges) == 0:
         return np.zeros((0, 3)), []
 
-    cluster, CP, CN, CQ, ce = _collapse(O, Q, N, rho, edges)
+    pin_in = None
+    if pin_verts is not None or bnd_verts is not None:
+        pin_in = np.zeros(O.shape[0], dtype=bool)
+        if pin_verts is not None:
+            pin_in |= np.asarray(pin_verts, dtype=bool)
+        if bnd_verts is not None:
+            pin_in |= np.asarray(bnd_verts, dtype=bool)
+    cluster, CP, CN, CQ, ce = _collapse(O, Q, N, rho, edges, pin_in)
     nc = CP.shape[0]
     if len(ce) == 0:
         return np.zeros((0, 3)), []
@@ -1954,6 +2161,14 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
     if projector is not None:
         frozen = cbnd_full | cpin_full
         r = dict(reg or {})
+        chain_nb, chain_move, snap_i, snap_p = _build_chains(
+            faces, frozen, P, corner_pts, crho_full)
+        if len(snap_i):
+            P = P.copy()
+            P[snap_i] = snap_p
+        if _DEBUG:
+            print("   [chains] pinned=%d faired=%d corner_anchors=%d"
+                  % (int(frozen.sum()), int(chain_move.sum()), len(snap_i)))
         P = _regularize(P, faces, frozen, projector, crho_full,
                         iters=int(r.get("regularize_iters", REGULARIZE_ITERS)),
                         w_square=float(r.get("w_square", W_SQUARE)),
@@ -1967,15 +2182,39 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
                         project_every=int(r.get("project_every",
                                                 PROJECT_EVERY)),
                         tol=float(r.get("regularize_tol", REGULARIZE_TOL)),
-                        uncapped=is_new)
+                        uncapped=is_new, chain_nb=chain_nb,
+                        chain_move=chain_move, feat_proj=feat_proj,
+                        chain_step=float(r.get("feature_step", FEATURE_STEP)),
+                        chain_drift=float(r.get("feature_max_drift",
+                                                FEATURE_MAX_DRIFT)),
+                        sym_axes=sym_axes)
         # Everything gets a final snap to the surface - including the frozen
         # crease/boundary vertices, which never move during fairing but still
         # start life on a tangent plane rather than on the mesh itself.
+        # chains are snapped to the feature curve, never to the surface
         moved = projector.project(P)
         d = moved - P
         dl = np.sqrt(np.einsum("ij,ij->i", d, d))
         ok = (dl <= 0.75 * crho_full) | is_new
+        ok &= ~frozen if feat_proj is not None else np.ones(len(P), bool)
         P = np.where(ok[:, None], moved, P)
+        if feat_proj is not None and np.any(frozen):
+            fi = np.nonzero(frozen)[0]
+            P[fi] = feat_proj.project(P[fi])
+            if len(snap_i):
+                P[snap_i] = snap_p
+            if _DEBUG:
+                dd = np.linalg.norm(feat_proj.project(P[fi]) - P[fi], axis=1)
+                cm2 = np.nonzero(chain_move)[0]
+                dc = (np.linalg.norm(feat_proj.project(P[cm2]) - P[cm2], axis=1)
+                      / np.maximum(crho_full[cm2], EPS)) if len(cm2) else np.zeros(1)
+                print("   [featfid] pinned max d/rho=%.2e  faired-chain max d/rho=%.2e"
+                      % ((dd / np.maximum(crho_full[fi], EPS)).max(), dc.max()))
+            if sym_axes:
+                for ax, tolp in sym_axes:
+                    on = np.abs(P[fi][:, ax]) <= tolp
+                    if on.any():
+                        P[fi[on], ax] = 0.0
 
     # ---- compact ---------------------------------------------------------
     used = np.zeros(len(P), dtype=bool)
@@ -2085,6 +2324,16 @@ def extract(V, F, sol, params=None):
     bnd_verts = np.zeros(n, dtype=bool)
     if len(be):
         bnd_verts[be.ravel()] = True
+    if sharp is not None and len(sharp):
+        # Dihedral detection on a sculpt is noisy: the Dinasty head yields 60
+        # feature components, half of them 1-2 segment stubs.  Pinning a stub
+        # anchors an output vertex to a meaningless "corner" and blocks the
+        # chain around it from fairing, so short fragments are dropped.  Real
+        # mesh boundaries are never filtered.
+        sharp = _filter_feature_fragments(
+            V, sharp, float(np.mean(rho)),
+            min_segs=int(p.get("feature_min_segs", FEATURE_MIN_SEGS)),
+            min_len=float(p.get("feature_min_len", FEATURE_MIN_LEN)))
     pin_list = []
     if sharp is not None and len(sharp):
         pin_list.append(sharp)
@@ -2092,34 +2341,57 @@ def extract(V, F, sol, params=None):
         pin_list.append(be)
     pin_mask = np.zeros(n, dtype=bool)
     pin_dir = np.zeros((n, 3))
+    pin_corner = np.zeros(n, dtype=bool)
+    feat_segs = np.zeros((0, 2), dtype=np.int64)
     if pin_list:
         se = np.concatenate(pin_list, axis=0)
         se = se[(se[:, 0] != se[:, 1]) & (se[:, 0] >= 0) & (se[:, 1] >= 0)
                 & (se[:, 0] < n) & (se[:, 1] < n)]
+        se = np.unique(np.sort(se, axis=1), axis=0)
         if len(se):
+            feat_segs = se
+            # Slide direction = the true feature TANGENT.  It must not be the
+            # 4-RoSy class representative used for the orientation field: that
+            # representative is just as happy pointing across the crease, and
+            # sliding a pinned sample along the perpendicular walks it clean
+            # off the feature (measured: up to 1.15 rho on a cube edge).
             d = normalize(V[se[:, 1]] - V[se[:, 0]])
             vi = np.concatenate([se[:, 0], se[:, 1]])
-            vd = np.concatenate([d, d])
-            nv = N[vi]
-            vd = vd - nv * _dot(vd, nv)[:, None]
-            vl = np.sqrt(np.einsum("ij,ij->i", vd, vd))
-            keep = vl > 1e-7
-            vi = vi[keep]
-            vd = vd[keep] / vl[keep][:, None]
+            vd = np.concatenate([d, -d])
+            fdeg = np.bincount(vi, minlength=n)
+            pin_mask = fdeg > 0
+            # sign-match every incident segment against a per-vertex reference
             ref = np.zeros((n, 3))
             ref[vi] = vd
-            rep = _match_4rosy(vd, N[vi], ref[vi])
+            sgn = np.where(_dot(vd, ref[vi]) < 0.0, -1.0, 1.0)
             acc = np.zeros((n, 3))
             for c in range(3):
-                acc[:, c] = np.bincount(vi, weights=rep[:, c], minlength=n)
-            acc -= N * _dot(acc, N)[:, None]
+                acc[:, c] = np.bincount(vi, weights=vd[:, c] * sgn,
+                                        minlength=n)
             al = np.sqrt(np.einsum("ij,ij->i", acc, acc))
-            pin_mask[vi] = True
             good = pin_mask & (al > 1e-7)
             pin_dir[good] = acc[good] / al[good][:, None]
-            fb = pin_mask & ~good
-            pin_dir[fb] = ref[fb]
-            pin_mask = good | fb
+            # A junction (feature valence != 2) or a genuine corner cannot
+            # slide at all: zero direction means "hold exactly at P".
+            pin_corner = _feature_corners(
+                V, se, n, fdeg,
+                corner_deg=float(p.get("feature_corner_deg",
+                                       FEATURE_CORNER_DEG)),
+                span=int(p.get("feature_corner_span", FEATURE_CORNER_SPAN)))
+            pin_corner &= pin_mask
+            pin_dir[pin_corner] = 0.0
+
+
+    feat_proj = None
+    corner_pts = None
+    if len(feat_segs):
+        feat_proj = _Projector(V, feat_segs)
+        if np.any(pin_corner):
+            corner_pts = V[pin_corner]
+    sym = p.get("symmetry") or ()
+    ext = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0)))
+    sym_axes = [(ax, 1e-5 * max(ext, 1e-12))
+                for ax in range(min(3, len(sym))) if sym[ax]] or None
 
     # ---- hierarchy + position field -------------------------------------
     rng = np.random.default_rng(int(p.get("seed", 0) or 0) & 0x7FFFFFFF)
@@ -2141,7 +2413,9 @@ def extract(V, F, sol, params=None):
                                bnd_verts=bnd_verts, projector=projector,
                                pin_verts=pin_mask, reg=p,
                                quad_floor=float(p.get("quad_floor",
-                                                      QUAD_FLOOR)))
+                                                      QUAD_FLOOR)),
+                               feat_proj=feat_proj, corner_pts=corner_pts,
+                               sym_axes=sym_axes)
         _lap("extract_core")
         nf = len(FQ)
         nq = sum(1 for f in FQ if len(f) == 4)
