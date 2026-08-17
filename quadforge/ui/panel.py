@@ -125,6 +125,7 @@ class VIEW3D_PT_quadforge(bpy.types.Panel):
         sub.prop(s, "hard_edge_angle")
         col.prop(s, "use_marked_sharp")
         col.prop(s, "use_materials")
+        col.prop(s, "use_uv_seams")
 
         col.separator()
         col.prop(s, "use_guides")

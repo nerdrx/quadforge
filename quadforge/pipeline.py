@@ -174,6 +174,77 @@ def discard_object(obj):
 # ---------------------------------------------------------------------------
 
 
+def split_small_shells_aside(work_obj, limit: int):
+    """Detach connected components smaller than ``limit`` faces into a side
+    mesh and return it (or None). Used by the exact-symmetry path: bisecting
+    thin centerline shells (hair plates, teeth, ruff leaves) shreds them into
+    seam pinholes — small shells are kept whole and rejoined after the mirror,
+    preserving their authored (already symmetric) topology."""
+    mesh = work_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.faces.ensure_lookup_table()
+    seen = set()
+    comps = []
+    for f0 in bm.faces:
+        if f0.index in seen:
+            continue
+        comp = []
+        stack = [f0]
+        seen.add(f0.index)
+        while stack:
+            f = stack.pop()
+            comp.append(f)
+            for e in f.edges:
+                for nf in e.link_faces:
+                    if nf.index not in seen:
+                        seen.add(nf.index)
+                        stack.append(nf)
+        comps.append(comp)
+    if len(comps) <= 1:
+        bm.free()
+        return None
+    biggest = max(range(len(comps)), key=lambda i: len(comps[i]))
+    small_faces = [f for i, comp in enumerate(comps)
+                   if i != biggest and len(comp) < limit
+                   for f in comp]
+    if not small_faces:
+        bm.free()
+        return None
+    side_mesh = bpy.data.meshes.new(mesh.name + "_side")
+    kept = set(f.index for f in small_faces)
+    tmp = bm.copy()
+    tmp.faces.ensure_lookup_table()
+    doomed = [f for f in tmp.faces if f.index not in kept]
+    bmesh.ops.delete(tmp, geom=doomed, context='FACES')
+    tmp.to_mesh(side_mesh)
+    tmp.free()
+    bmesh.ops.delete(bm, geom=small_faces, context='FACES')
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    if len(side_mesh.polygons) == 0 or len(mesh.polygons) == 0:
+        try:
+            bpy.data.meshes.remove(side_mesh)
+        except Exception:
+            pass
+        return None
+    return side_mesh
+
+
+def rejoin_side_mesh(work_obj, side_mesh) -> None:
+    bm = bmesh.new()
+    bm.from_mesh(work_obj.data)
+    bm.from_mesh(side_mesh)
+    bm.to_mesh(work_obj.data)
+    bm.free()
+    work_obj.data.update()
+    try:
+        bpy.data.meshes.remove(side_mesh)
+    except Exception:
+        pass
+
+
 def bisect_to_half(work_obj, axes, eps: float) -> bool:
     """Cut the mesh at every symmetry plane, keep the negative side, and snap
     the cut vertices exactly onto the planes. False if nothing survived."""
@@ -543,6 +614,12 @@ def preprocess(context, work_obj, s, report: dict) -> None:
         report.setdefault("warnings", []).append(f"hard edge detection failed: {exc}")
         report["hard_edges"] = 0
 
+    if getattr(s, "use_uv_seams", False):
+        try:
+            report["uv_seam_edges"] = analysis.uv_island_boundaries_to_sharp(work_obj)
+        except Exception as exc:
+            report.setdefault("warnings", []).append(f"UV seam detection failed: {exc}")
+
     if getattr(s, "use_materials", False):
         try:
             report["material_boundary_edges"] = analysis.material_boundaries_to_sharp(work_obj)
@@ -660,6 +737,22 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
     report["symmetry_axes"] = [_AXIS_NAMES[a] for a in axes]
     eps = max(_mean_edge_length(work_obj.data) * 1e-3, 1e-7)
 
+    # keep small shells out of the bisect: cutting thin centerline shells
+    # (hair, teeth, ruff) shreds them into seam pinholes
+    side_mesh = None
+    if bool(getattr(s, "preserve_small_shells", True)):
+        limit = int(getattr(s, "small_shell_limit", 0) or 0)
+        if limit <= 0:
+            limit = max(64, int(0.02 * len(work_obj.data.polygons)))
+        try:
+            side_mesh = split_small_shells_aside(work_obj, limit)
+            if side_mesh is not None:
+                report["side_shell_faces"] = len(side_mesh.polygons)
+        except Exception as exc:
+            report.setdefault("warnings", []).append(
+                f"small-shell split failed: {exc}")
+            side_mesh = None
+
     # keep a copy so we can fall back if bisecting destroys the mesh
     backup = bmesh.new()
     backup.from_mesh(work_obj.data)
@@ -668,6 +761,9 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
         backup.to_mesh(work_obj.data)
         backup.free()
         work_obj.data.update()
+        if side_mesh is not None:
+            rejoin_side_mesh(work_obj, side_mesh)
+            side_mesh = None
         report.setdefault("warnings", []).append(
             "exact symmetry: bisecting left no geometry, falling back to solver symmetry"
         )
@@ -692,6 +788,9 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
 
     snap_tol = max(_mean_edge_length(work_obj.data) * 0.25, 1e-6)
     leftover = mirror_weld(work_obj, axes, snap_tol)
+    if side_mesh is not None:
+        rejoin_side_mesh(work_obj, side_mesh)
+        side_mesh = None
     report["seam_open_edges"] = leftover
     if leftover:
         report.setdefault("warnings", []).append(
@@ -975,7 +1074,9 @@ def run_remesh(context, obj, s) -> dict:
         # surface the preprocessing counts so callers don't have to parse
         # last_report just to show what QuadForge did
         for key in ("input_faces", "input_verts", "hard_edges", "guide_edges",
-                    "material_boundary_edges", "symmetry_mode", "requested_faces"):
+                    "material_boundary_edges", "uv_seam_edges", "seam_open_edges",
+                    "orientation_flipped_faces", "restored_faces",
+                    "symmetry_mode", "requested_faces"):
             if key in report:
                 stats.setdefault(key, report[key])
         report["stats"] = stats

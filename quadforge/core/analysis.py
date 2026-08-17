@@ -206,6 +206,80 @@ def material_boundaries_to_sharp(work_obj) -> int:
     return int(boundary.sum())
 
 
+def uv_island_boundaries_to_sharp(work_obj, eps: float = 1e-5) -> int:
+    """UV island boundaries become sharp feature edges, so the solvers align
+    edge flow along them and texture seams survive the remesh.
+
+    An edge is an island boundary when its two adjacent faces disagree about
+    either endpoint's UV coordinate (or when it is explicitly marked as a
+    seam)."""
+    mesh = work_obj.data
+    uvl = mesh.uv_layers.active
+    ne = len(mesh.edges)
+    nl = len(mesh.loops)
+    if uvl is None or ne == 0 or nl == 0:
+        return 0
+
+    uv = np.empty(nl * 2)
+    uvl.data.foreach_get("uv", uv)
+    uv = uv.reshape(-1, 2)
+    lv = np.empty(nl, dtype=np.int64)
+    mesh.loops.foreach_get("vertex_index", lv)
+    # loop -> owning face
+    starts = np.empty(len(mesh.polygons), dtype=np.int64)
+    totals = np.empty(len(mesh.polygons), dtype=np.int64)
+    mesh.polygons.foreach_get("loop_start", starts)
+    mesh.polygons.foreach_get("loop_total", totals)
+    lf = np.repeat(np.arange(len(mesh.polygons), dtype=np.int64), totals)
+
+    # (face, vert) -> loop lookup via sorted composite keys
+    nv = len(mesh.vertices)
+    keys = lf * nv + lv
+    order = np.argsort(keys)
+    sorted_keys = keys[order]
+
+    def uv_at(face_idx, vert_idx):
+        k = face_idx * nv + vert_idx
+        pos = np.searchsorted(sorted_keys, k)
+        pos = np.clip(pos, 0, nl - 1)
+        hit = sorted_keys[pos] == k
+        li = order[pos]
+        out = np.zeros((len(k), 2))
+        out[hit] = uv[li[hit]]
+        return out, hit
+
+    counts, f0, f1 = edge_face_incidence(mesh)
+    ev = np.empty(ne * 2, dtype=np.int64)
+    mesh.edges.foreach_get("vertices", ev)
+    ev = ev.reshape(-1, 2)
+
+    man = counts == 2
+    boundary = np.zeros(ne, dtype=bool)
+    if man.any():
+        idx = np.nonzero(man)[0]
+        for corner in (0, 1):
+            v = ev[idx, corner]
+            a, ha = uv_at(f0[idx], v)
+            b, hb = uv_at(f1[idx], v)
+            ok = ha & hb
+            diff = np.zeros(len(idx), dtype=bool)
+            diff[ok] = np.abs(a[ok] - b[ok]).max(axis=1) > eps
+            boundary[idx] |= diff
+
+    seams = np.zeros(ne, dtype=bool)
+    mesh.edges.foreach_get("use_seam", seams)
+    boundary |= seams
+
+    if not boundary.any():
+        return 0
+    sharp = np.zeros(ne, dtype=bool)
+    mesh.edges.foreach_get("use_edge_sharp", sharp)
+    sharp |= boundary
+    mesh.edges.foreach_set("use_edge_sharp", sharp)
+    mesh.update()
+    return int(boundary.sum())
+
+
 # ---------------------------------------------------------------------------
 # density / curvature
 # ---------------------------------------------------------------------------

@@ -69,6 +69,13 @@ class QF_Settings(bpy.types.PropertyGroup):
         description="Preserve edge loops along material boundaries",
         default=False,
     )
+    use_uv_seams: BoolProperty(
+        name="Follow UV Islands",
+        description="Treat UV island boundaries (and marked seams) as feature "
+                    "edges: edge flow aligns along them and texture seams "
+                    "survive the remesh",
+        default=False,
+    )
 
     use_guides: BoolProperty(
         name="Use Guides",
