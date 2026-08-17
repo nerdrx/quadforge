@@ -812,10 +812,29 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
 
     if not exact:
         report["symmetry_mode"] = "solver" if axes else "none"
-        stats = _call_backend(context, backend, work_obj, s, requested, report=report)
-        report["backend_stats"] = stats if isinstance(stats, dict) else {}
-        if post_pass is not None:
-            post_pass(work_obj, face_target)
+        # shell preservation for every backend, not just the exact-sym path:
+        # small authored shells (hair, teeth, piercings) stay verbatim
+        side_mesh = None
+        if bool(getattr(s, "preserve_small_shells", True)):
+            limit = int(getattr(s, "small_shell_limit", 0) or 0)
+            if limit <= 0:
+                limit = max(64, int(0.02 * len(work_obj.data.polygons)))
+            try:
+                side_mesh = split_small_shells_aside(work_obj, limit)
+                if side_mesh is not None:
+                    report["side_shell_faces"] = len(side_mesh.polygons)
+            except Exception as exc:
+                report.setdefault("warnings", []).append(
+                    f"small-shell split failed: {exc}")
+                side_mesh = None
+        try:
+            stats = _call_backend(context, backend, work_obj, s, requested, report=report)
+            report["backend_stats"] = stats if isinstance(stats, dict) else {}
+            if post_pass is not None:
+                post_pass(work_obj, face_target)
+        finally:
+            if side_mesh is not None:
+                rejoin_side_mesh(work_obj, side_mesh)
         return
 
     report["symmetry_mode"] = "exact"

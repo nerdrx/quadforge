@@ -68,6 +68,7 @@ Pipeline
 from __future__ import annotations
 
 import os
+import time as _time
 
 import numpy as np
 
@@ -95,6 +96,12 @@ MAX_ORBIT = 8
 SPLIT_RATIO = 0.55
 MAX_REFINE_ROUNDS = 8
 MAX_REFINE_VERTS = 400_000
+
+# A connected shell smaller than a couple of lattice cells cannot carry a quad
+# ring and extracts to nothing - on a real avatar the eyes, teeth, buttons and
+# hair cards are dozens of such shells and can be 40% of the surface.  rho is
+# clamped per shell so every shell keeps at least this many quads.
+MIN_SHELL_QUADS = 16.0
 
 __all__ = ["extract", "extract_quads", "make_solution"]
 
@@ -201,6 +208,24 @@ def _edge_lookup(e, n):
         pos = np.searchsorted(skey, lo * np.int64(n) + hi)
         return order[np.clip(pos, 0, len(skey) - 1)]
     return eid
+
+
+def _clamp_rho_per_shell(V, F, rho, edges, min_quads=MIN_SHELL_QUADS):
+    """Cap ``rho`` per connected shell so no shell extracts to nothing."""
+    n = len(V)
+    roots = _union_find(n, edges)
+    uniq, comp = np.unique(roots, return_inverse=True)
+    if len(uniq) < 2:
+        return rho
+    ar = _tri_areas(V, F)
+    carea = np.bincount(comp[F[:, 0]], weights=ar, minlength=len(uniq))
+    cap = np.sqrt(np.maximum(carea, 0.0) / float(min_quads))
+    cap = np.where(cap > 0.0, cap, np.inf)
+    out = np.minimum(rho, cap[comp])
+    if _DEBUG:
+        hit = int((out < rho - 1e-15).sum())
+        print("   [shells] components=%d verts_clamped=%d" % (len(uniq), hit))
+    return out
 
 
 def _refine_for_lattice(V, F, N, Q, rho, sharp, ratio=SPLIT_RATIO,
@@ -1382,6 +1407,11 @@ def _annihilate_triangles(P, faces, max_depth=16, rounds=16,
 # --------------------------------------------------------------------------
 
 def _closest_on_tri(P, A, B, C):
+    """Closest point on each triangle (Ericson's region test), vectorised.
+
+    Region overrides are evaluated on the masked subset only - building six
+    full-size candidate arrays was the single hottest line in the profile.
+    """
     AB = B - A
     AC = C - A
     AP = P - A
@@ -1398,61 +1428,87 @@ def _closest_on_tri(P, A, B, C):
     vb = d5 * d2 - d1 * d6
     vc = d1 * d4 - d3 * d2
     denom = va + vb + vc
-    inv = 1.0 / np.where(np.abs(denom) < 1e-30, 1.0, denom)
-    v = vb * inv
-    w = vc * inv
-    res = A + AB * v[:, None] + AC * w[:, None]
-    res = np.where((np.abs(denom) < 1e-30)[:, None], A, res)
+    flat = np.abs(denom) < 1e-30
+    inv = 1.0 / np.where(flat, 1.0, denom)
+    res = A + AB * (vb * inv)[:, None] + AC * (vc * inv)[:, None]
+    if flat.any():
+        res[flat] = A[flat]
 
-    def _set(mask, val):
-        if mask.any():
-            res[mask] = val[mask]
+    def _safe(num, den):
+        return num / np.where(np.abs(den) < 1e-30, 1.0, den)
 
-    den = d1 - d3
-    t = d1 / np.where(np.abs(den) < 1e-30, 1.0, den)
-    _set((vc <= 0) & (d1 >= 0) & (d3 <= 0), A + AB * t[:, None])
-    den = d2 - d6
-    t = d2 / np.where(np.abs(den) < 1e-30, 1.0, den)
-    _set((vb <= 0) & (d2 >= 0) & (d6 <= 0), A + AC * t[:, None])
-    num = d4 - d3
-    den = num + (d5 - d6)
-    t = num / np.where(np.abs(den) < 1e-30, 1.0, den)
-    _set((va <= 0) & (num >= 0) & ((d5 - d6) >= 0), B + (C - B) * t[:, None])
+    m = (vc <= 0) & (d1 >= 0) & (d3 <= 0)                 # edge AB
+    if m.any():
+        k = np.nonzero(m)[0]
+        res[k] = A[k] + AB[k] * _safe(d1[k], d1[k] - d3[k])[:, None]
+    m = (vb <= 0) & (d2 >= 0) & (d6 <= 0)                 # edge AC
+    if m.any():
+        k = np.nonzero(m)[0]
+        res[k] = A[k] + AC[k] * _safe(d2[k], d2[k] - d6[k])[:, None]
+    m = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0)   # edge BC
+    if m.any():
+        k = np.nonzero(m)[0]
+        num = d4[k] - d3[k]
+        t = _safe(num, num + (d5[k] - d6[k]))
+        res[k] = B[k] + (C[k] - B[k]) * t[:, None]
 
-    _set((d1 <= 0) & (d2 <= 0), A)
-    _set((d3 >= 0) & (d4 <= d3), B)
-    _set((d6 >= 0) & (d5 <= d6), C)
+    m = (d1 <= 0) & (d2 <= 0)                             # corner A
+    if m.any():
+        res[m] = A[m]
+    m = (d3 >= 0) & (d4 <= d3)                            # corner B
+    if m.any():
+        res[m] = B[m]
+    m = (d6 >= 0) & (d5 <= d6)                            # corner C
+    if m.any():
+        res[m] = C[m]
     return res
 
 
 class _Projector:
-    """Nearest point on a triangle mesh via a uniform grid."""
+    """Nearest point on a triangle mesh via a uniform grid.
 
-    def __init__(self, V, F, res=64):
-        self.V = V
-        self.F = F
-        self.lo = V.min(axis=0)
-        hi = V.max(axis=0)
-        ext = np.maximum(hi - self.lo, 1e-12)
+    Fully batched: one ragged gather builds every (query, candidate triangle)
+    pair, then a single ``_closest_on_tri`` call and a segment-min pick the
+    winners.  Looping per grid cell instead cost ~25 s on a 91 k-triangle
+    avatar, almost all of it small-array numpy overhead.
+    """
+
+    MAX_PAIRS = 4_000_000
+
+    def __init__(self, V, F, max_dims=512):
+        self.V = np.ascontiguousarray(V, dtype=np.float64)
+        self.F = np.ascontiguousarray(F, dtype=np.int64)
+        self.lo = self.V.min(axis=0)
+        ext = np.maximum(self.V.max(axis=0) - self.lo, 1e-12)
         self.diag = float(np.linalg.norm(ext))
-        nf = max(len(F), 1)
-        cell = max(self.diag / float(res), self.diag / max(nf ** (1.0 / 3.0), 1.0))
-        self.dims = np.maximum(np.ceil(ext / max(cell, 1e-12)).astype(np.int64), 1)
-        self.dims = np.minimum(self.dims, 128)
+        if len(F):
+            tri = self.V[self.F]
+            # median, not mean: sculpts mix 5x size ranges and the mean would
+            # leave hundreds of tiny triangles in every dense cell
+            elen = np.median(np.linalg.norm(tri[:, [1, 2, 0]] - tri, axis=2))
+        else:
+            elen = self.diag
+        cell = max(1.5 * float(elen), self.diag / float(max_dims))
+        self.dims = np.clip(np.ceil(ext / cell).astype(np.int64), 1, max_dims)
         self.cell = ext / self.dims
 
-        # every triangle goes into the cells of its three corners + centroid
-        cen = V[F].mean(axis=1)
-        pts = np.concatenate([V[F[:, 0]], V[F[:, 1]], V[F[:, 2]], cen], axis=0)
+        if len(F) == 0:
+            self.uniq_key = np.zeros(0, dtype=np.int64)
+            self.start = np.zeros(0, dtype=np.int64)
+            self.count = np.zeros(0, dtype=np.int64)
+            self.tri_sorted = np.zeros(0, dtype=np.int64)
+            return
+        # every triangle is registered in the cells of its corners + centroid
+        cen = self.V[self.F].mean(axis=1)
+        pts = np.concatenate([self.V[self.F[:, 0]], self.V[self.F[:, 1]],
+                              self.V[self.F[:, 2]], cen], axis=0)
         tid = np.tile(np.arange(len(F), dtype=np.int64), 4)
-        cid = self._cell_of(pts)
-        key = self._key(cid)
+        key = self._key(self._cell_of(pts))
         order = np.argsort(key, kind="stable")
         self.tri_sorted = tid[order]
-        self.key_sorted = key[order]
-        self.uniq_key, self.uniq_start = np.unique(self.key_sorted,
-                                                   return_index=True)
-        self.uniq_end = np.append(self.uniq_start[1:], len(self.key_sorted))
+        skey = key[order]
+        self.uniq_key, self.start, self.count = np.unique(
+            skey, return_index=True, return_counts=True)
 
     def _cell_of(self, P):
         c = np.floor((P - self.lo) / self.cell).astype(np.int64)
@@ -1461,69 +1517,87 @@ class _Projector:
     def _key(self, c):
         return (c[:, 0] * self.dims[1] + c[:, 1]) * self.dims[2] + c[:, 2]
 
-    def _tris_in(self, keys):
-        out = []
-        pos = np.searchsorted(self.uniq_key, keys)
-        pos = np.clip(pos, 0, len(self.uniq_key) - 1)
-        hit = self.uniq_key[pos] == keys
-        for p in pos[hit]:
-            out.append(self.tri_sorted[self.uniq_start[p]:self.uniq_end[p]])
-        if not out:
-            return np.zeros(0, dtype=np.int64)
-        return np.unique(np.concatenate(out))
+    def _gather(self, cid, radius):
+        """Ragged (query, triangle) pair lists for a neighbourhood radius."""
+        o = np.arange(-radius, radius + 1)
+        neigh = np.stack(np.meshgrid(o, o, o, indexing="ij"),
+                         axis=-1).reshape(-1, 3)
+        cells = cid[:, None, :] + neigh[None, :, :]
+        inb = np.all((cells >= 0) & (cells < self.dims[None, None, :]), axis=2)
+        flat = cells.reshape(-1, 3)
+        keys = self._key(flat)
+        pos = np.clip(np.searchsorted(self.uniq_key, keys), 0,
+                      max(len(self.uniq_key) - 1, 0))
+        hit = inb.ravel() & (self.uniq_key[pos] == keys) if len(
+            self.uniq_key) else np.zeros(len(keys), dtype=bool)
+        cnt = np.where(hit, self.count[pos], 0)
+        st = np.where(hit, self.start[pos], 0)
+        tot = int(cnt.sum())
+        if tot == 0:
+            return None, None, np.zeros(len(cid), dtype=np.int64)
+        off = np.zeros(len(cnt) + 1, dtype=np.int64)
+        np.cumsum(cnt, out=off[1:])
+        run = np.arange(tot) - np.repeat(off[:-1], cnt)
+        tri_idx = self.tri_sorted[np.repeat(st, cnt) + run]
+        qrep = np.repeat(np.arange(len(cid), dtype=np.int64), len(neigh))
+        pt_idx = np.repeat(qrep, cnt)
+        return pt_idx, tri_idx, cnt.reshape(len(cid), -1).sum(axis=1)
+
+    def _solve(self, P, pt_idx, tri_idx, out, best):
+        """Segment-min over the candidate pairs; keeps the running best."""
+        tri = self.F[tri_idx]
+        cp = _closest_on_tri(P[pt_idx], self.V[tri[:, 0]], self.V[tri[:, 1]],
+                             self.V[tri[:, 2]])
+        d = cp - P[pt_idx]
+        d2 = np.einsum("ij,ij->i", d, d)
+        order = np.lexsort((d2, pt_idx))
+        sp = pt_idx[order]
+        first = np.ones(len(sp), dtype=bool)
+        first[1:] = sp[1:] != sp[:-1]
+        win = order[first]
+        tgt = sp[first]
+        better = d2[win] < best[tgt]
+        out[tgt[better]] = cp[win[better]]
+        best[tgt[better]] = d2[win[better]]
 
     def project(self, P):
-        P = np.asarray(P, dtype=np.float64).reshape(-1, 3)
+        """Exact nearest point on the input surface for every row of ``P``.
+
+        A radius-``r`` neighbourhood only proves a hit when the distance found
+        is below ``r * min(cell)``; anything further out is re-queried with a
+        wider ring and finally brute-forced, so the result never silently
+        depends on the grid resolution.
+        """
+        P = np.ascontiguousarray(np.asarray(P, dtype=np.float64).reshape(-1, 3))
         out = P.copy()
         if len(self.F) == 0 or len(P) == 0:
             return out
-        cid = self._cell_of(P)
-        key = self._key(cid)
-        order = np.argsort(key, kind="stable")
-        skey = key[order]
-        bounds = np.append(np.append(0, np.nonzero(np.diff(skey))[0] + 1),
-                           len(skey))
-        offs = np.arange(-1, 2)
-        neigh = np.stack(np.meshgrid(offs, offs, offs, indexing="ij"),
-                         axis=-1).reshape(-1, 3)
-        for b in range(len(bounds) - 1):
-            sel = order[bounds[b]:bounds[b + 1]]
-            base = cid[sel[0]]
-            tris = np.zeros(0, dtype=np.int64)
-            for r in (1, 2, 4):
-                if r == 1:
-                    cells = base[None, :] + neigh
-                else:
-                    o = np.arange(-r, r + 1)
-                    cells = np.stack(
-                        np.meshgrid(o, o, o, indexing="ij"),
-                        axis=-1).reshape(-1, 3) + base[None, :]
-                ok = np.all((cells >= 0) & (cells < self.dims[None, :]), axis=1)
-                cells = cells[ok]
-                if len(cells) == 0:
-                    continue
-                tris = self._tris_in(self._key(cells))
-                if len(tris):
-                    break
-            if len(tris) == 0:
-                tris = np.arange(len(self.F), dtype=np.int64)
-            pts = P[sel]
-            step = max(1, int(4e6 // max(len(tris), 1)))
-            for c0 in range(0, len(pts), step):
-                chunk = pts[c0:c0 + step]
-                k = len(chunk)
-                t = len(tris)
-                pp = np.repeat(chunk, t, axis=0)
-                tt = np.tile(tris, k)
-                tri = self.F[tt]
-                cp = _closest_on_tri(pp, self.V[tri[:, 0]], self.V[tri[:, 1]],
-                                     self.V[tri[:, 2]])
-                d = ((cp - pp) ** 2).sum(axis=1).reshape(k, t)
-                best = np.argmin(d, axis=1)
-                res = cp.reshape(k, t, 3)[np.arange(k), best]
-                out[sel[c0:c0 + step]] = res
+        best = np.full(len(P), np.inf)
+        todo = np.arange(len(P), dtype=np.int64)
+        for radius in (0, 1, 2, 4, 8):
+            if len(todo) == 0:
+                break
+            cid = self._cell_of(P[todo])
+            pt_idx, tri_idx, _per = self._gather(cid, radius)
+            if pt_idx is not None:
+                nchunk = max(1, int(np.ceil(len(pt_idx) / self.MAX_PAIRS)))
+                bnd = np.linspace(0, len(pt_idx), nchunk + 1).astype(int)
+                for a, b in zip(bnd[:-1], bnd[1:]):
+                    self._solve(P, todo[pt_idx[a:b]], tri_idx[a:b], out, best)
+            # exact guarantee: the searched cube reaches this far from P
+            lo_b = self.lo + (cid - radius) * self.cell
+            hi_b = self.lo + (cid + radius + 1) * self.cell
+            safe = np.maximum(
+                np.minimum(P[todo] - lo_b, hi_b - P[todo]).min(axis=1), 0.0)
+            todo = todo[best[todo] > safe ** 2]
+        if len(todo):
+            allt = np.arange(len(self.F), dtype=np.int64)
+            step = max(1, int(self.MAX_PAIRS // max(len(allt), 1)))
+            for a in range(0, len(todo), step):
+                blk = todo[a:a + step]
+                self._solve(P, np.repeat(blk, len(allt)),
+                            np.tile(allt, len(blk)), out, best)
         return out
-
 
 # --------------------------------------------------------------------------
 # relaxation
@@ -1793,6 +1867,20 @@ def extract(V, F, sol, params=None):
     else:
         sharp = None
 
+    _t = _time.time() if _DEBUG else 0.0
+
+    def _lap(tag):
+        nonlocal _t
+        if _DEBUG:
+            now = _time.time()
+            print("   [time] %-12s %.2fs" % (tag, now - _t))
+            _t = now
+
+    _lap("projector")
+    if p.get("shell_clamp", True):
+        rho = _clamp_rho_per_shell(
+            V, F, rho, _build_edges(F),
+            min_quads=float(p.get("min_shell_quads", MIN_SHELL_QUADS)))
     if p.get("refine", True):
         # allow one retry step of rho headroom before the lattice gets finer
         V, F, N, Q, rho, sharp = _refine_for_lattice(
@@ -1800,6 +1888,7 @@ def extract(V, F, sol, params=None):
             max_verts=int(p.get("max_refine_verts", MAX_REFINE_VERTS)))
         rho = rho / 0.8
         n = V.shape[0]
+    _lap("refine")
 
     edges = _build_edges(F)
     if len(edges) == 0:
@@ -1851,18 +1940,22 @@ def extract(V, F, sol, params=None):
     rng = np.random.default_rng(int(p.get("seed", 0) or 0) & 0x7FFFFFFF)
     levels = _build_pos_hierarchy(V, N, Q, rho, indptr, indices,
                                   pin_mask, pin_dir, rng)
+    _lap("hierarchy")
     pos_iters = int(p.get("pos_iters", 20) or 20)
     target = int(p.get("target_faces", 0) or 0)
     in_area = float(_tri_areas(V0, F0).sum())
 
     best = None
+    best_cover = -1.0
     scale = 1.0
     attempts = int(p.get("attempts", 3) or 3)
     for _a in range(max(1, attempts)):
         O = _solve_positions(levels, scale, pos_iters)
+        _lap("positions")
         VQ, FQ = _extract_core(O, Q, N, rho * scale, edges,
                                bnd_verts=bnd_verts, projector=projector,
                                relax_iters=int(p.get("relax_iters", 4)))
+        _lap("extract_core")
         nf = len(FQ)
         nq = sum(1 for f in FQ if len(f) == 4)
         cover = (_poly_area(VQ, FQ) / in_area) if (nf and in_area > 0) else 0.0
@@ -1877,13 +1970,20 @@ def extract(V, F, sol, params=None):
                                   100.0 * cover, score))
         if best is None or score < best[0]:
             best = (score, VQ, FQ)
+        prev_cover = best_cover
+        best_cover = max(best_cover, cover)
         if target <= 0:
             break
         if nf == 0:
             scale *= 0.6
             continue
         ratio = nf / float(target)
-        if 0.82 <= ratio <= 1.22 and cover >= 0.95:
+        # Stop once the face count is on target and coverage is either good or
+        # no longer improving - some inputs (shells too small to carry a quad
+        # ring at any budget) simply cannot reach 95%, and burning two more
+        # full attempts on them is pure latency.
+        if 0.82 <= ratio <= 1.22 and (cover >= 0.95
+                                      or cover <= prev_cover + 0.01):
             break
         scale *= float(np.clip(np.sqrt(ratio), 0.55, 1.8))
 
