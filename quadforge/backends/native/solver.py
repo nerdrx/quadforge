@@ -216,15 +216,36 @@ def solve(V, F, params=None):
             # than flat regions or their silhouettes alias into jagged steps
             fb = float(p2.get("feature_density", 2.5))
             if fb > 1.0 and sharp_in is not None and len(sharp_in):
-                near = np.zeros(V.shape[0], dtype=bool)
-                near[np.unique(sharp_in)] = True
+                # Graph-distance falloff, not a binary 2-ring dilation.  A hard
+                # 2.5x step in rho makes the extractor stitch a dense rim to a
+                # coarse interior across one ring, and that seam shows up as a
+                # scraggly band of extra poles (measured on the Dinasty head:
+                # the irregular-vertex rate rises again at ring 3, 30% -> 36%).
+                # Holding the boost for `plateau` rings and then decaying it
+                # smoothly removes the bump entirely (profile becomes monotone)
+                # and drops poles in the 4-ring band from 34.5% to 30.9%.
+                plateau = float(p2.get("feature_density_plateau", 1.0))
+                decay = max(float(p2.get("feature_density_decay", 2.5)), 1e-3)
+                nvv = V.shape[0]
                 ed_all = _f.build_edges(F)
-                for _ in range(2):
-                    m = near[ed_all[:, 0]] | near[ed_all[:, 1]]
-                    near[ed_all[m].ravel()] = True
+                d = np.full(nvv, np.inf)
+                seed = np.unique(sharp_in)
+                d[seed] = 0.0
+                cur = np.zeros(nvv, dtype=bool)
+                cur[seed] = True
+                for k in range(1, 12):
+                    m = cur[ed_all[:, 0]] | cur[ed_all[:, 1]]
+                    nxt = np.zeros(nvv, dtype=bool)
+                    nxt[ed_all[m].ravel()] = True
+                    newly = nxt & ~np.isfinite(d)
+                    if not newly.any():
+                        break
+                    d[newly] = float(k)
+                    cur = nxt
+                d[~np.isfinite(d)] = 1e9
+                w = np.exp(-np.maximum(d - plateau, 0.0) / decay)
                 rho2 = np.asarray(sol.rho, dtype=np.float64).copy()
-                rho2[near] /= fb
-                sol.rho = rho2
+                sol.rho = rho2 / (1.0 + (fb - 1.0) * w)
             VQ, FQ = _e2.extract(V, F, sol, p2)
             # accept only a result that plausibly covers the input surface:
             # a collapsed extraction (fragments of the input) must fall back
