@@ -559,6 +559,30 @@ def _solve(context, work_obj, s, stats, **params):
             if round_i and not remaining:
                 stats["stall_retries"] = round_i
 
+        # Shells QuadriFlow refuses (degenerate card stacks) get a second
+        # chance with the native field solver before falling back to their
+        # original topology — a remeshed card blends in, original tris don't.
+        if gave_up:
+            native = None
+            try:
+                from . import native as _native
+                if hasattr(_native, "remesh"):
+                    native = _native
+            except Exception:
+                native = None
+            if native is not None:
+                rescued = []
+                for p in gave_up:
+                    try:
+                        native.remesh(context, p, s, per_part[p.name]["target_faces"])
+                        _fuse_stray_tris(p.data)
+                        rescued.append(p)
+                    except Exception:
+                        pass
+                if rescued:
+                    stats["native_rescued_parts"] = len(rescued)
+                    gave_up = [p for p in gave_up if p not in rescued]
+
         if gave_up:
             stats["unsolvable_parts"] = len(gave_up)
             stats["unsolvable_part_faces"] = sum(len(p.data.polygons) for p in gave_up)

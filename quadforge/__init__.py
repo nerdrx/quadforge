@@ -1,7 +1,7 @@
 bl_info = {
     "name": "QuadForge",
     "author": "nerdrx + Claude",
-    "version": (0, 2, 2),
+    "version": (0, 2, 3),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > QuadForge",
     "description": "Free auto-retopology: adaptive quad remeshing with guides, symmetry and full data preservation",
