@@ -212,6 +212,19 @@ def solve(V, F, params=None):
             p2["guide_dirs"] = guide_in
             p2.setdefault("curvature_align", 0.7)
             sol = _f2.solve_fields(V, F, p2)
+            # feature-density boost: thin rims and creases need denser quads
+            # than flat regions or their silhouettes alias into jagged steps
+            fb = float(p2.get("feature_density", 1.5))
+            if fb > 1.0 and sharp_in is not None and len(sharp_in):
+                near = np.zeros(V.shape[0], dtype=bool)
+                near[np.unique(sharp_in)] = True
+                ed_all = _f.build_edges(F)
+                for _ in range(2):
+                    m = near[ed_all[:, 0]] | near[ed_all[:, 1]]
+                    near[ed_all[m].ravel()] = True
+                rho2 = np.asarray(sol.rho, dtype=np.float64).copy()
+                rho2[near] /= fb
+                sol.rho = rho2
             VQ, FQ = _e2.extract(V, F, sol, p2)
             # accept only a result that plausibly covers the input surface:
             # a collapsed extraction (fragments of the input) must fall back
