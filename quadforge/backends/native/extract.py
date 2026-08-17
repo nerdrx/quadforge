@@ -103,6 +103,27 @@ MAX_REFINE_VERTS = 400_000
 # clamped per shell so every shell keeps at least this many quads.
 MIN_SHELL_QUADS = 16.0
 
+# Output polish.  The extracted lattice is topologically clean but visually
+# jittery (neighbouring quads varying ~2x in area); these drive the fairing
+# pass that evens edge lengths and squares corners.  Overridable through
+# params: regularize_iters / regularize_step / w_square / w_even / w_laplace /
+# max_drift.
+REGULARIZE_ITERS = 120
+REGULARIZE_STEP = 0.8
+W_SQUARE = 1.2
+W_EVEN = 1.0
+W_LAPLACE = 0.35
+MAX_DRIFT = 1.25
+SIZE_LOCK = 0.5
+REST_SMOOTH = 6
+REST_RHO = 0.25
+PROJECT_EVERY = 6
+# stop early once the pass stops moving anything (relative to local rho)
+REGULARIZE_TOL = 6e-4
+
+# escalate triangle-annihilation walk length only below this quad ratio
+QUAD_FLOOR = 0.975
+
 __all__ = ["extract", "extract_quads", "make_solution"]
 
 
@@ -1633,10 +1654,79 @@ def _vertex_normals_poly(P, tris, quads, n):
     return normalize(N)
 
 
-def _relax(P, faces, frozen, projector, rho_v, iters=4, step=0.5,
-           uncapped=None):
+def _square_targets(P, quads, n, rest=None, size_lock=0.0):
+    """Per-vertex target from each quad's best-fit square.
+
+    In the quad's own plane the four corners are complex numbers ``z_k``; a
+    perfect square is ``z_k = a * i**k`` for one complex ``a``, so the
+    least-squares fit is just ``a = mean(z_k * conj(i**k))`` - rotation and
+    scale come out free.  Pulling corners toward ``a * i**k`` is the
+    "squarify" half of the polish (cf. Instant Meshes' output smoothing).
+    """
+    acc = np.zeros((n, 3))
+    cnt = np.zeros(n)
+    if not len(quads):
+        return acc, cnt
+    p = P[quads]                                   # (m,4,3)
+    c = p.mean(axis=1)
+    d = p - c[:, None, :]
+    nrm = np.cross(p[:, 2] - p[:, 0], p[:, 3] - p[:, 1])
+    nl = np.sqrt(np.einsum("ij,ij->i", nrm, nrm))
+    ok = nl > 1e-14
+    nrm = nrm / np.maximum(nl, 1e-14)[:, None]
+    u = d[:, 0] - nrm * _dot(d[:, 0], nrm)[:, None]
+    ul = np.sqrt(np.einsum("ij,ij->i", u, u))
+    deg = ul < 1e-12
+    if deg.any():
+        u[deg] = _any_tangent(nrm[deg])
+        ul = np.sqrt(np.einsum("ij,ij->i", u, u))
+    u = u / np.maximum(ul, 1e-14)[:, None]
+    w = np.cross(nrm, u)
+
+    x = np.einsum("mkc,mc->mk", d, u)
+    y = np.einsum("mkc,mc->mk", d, w)
+    # a = 1/4 * sum_k (x_k + i y_k) * conj(i**k),  conj(i**k) = 1, -i, -1, i
+    ar = 0.25 * (x[:, 0] + y[:, 1] - x[:, 2] - y[:, 3])
+    ai = 0.25 * (y[:, 0] - x[:, 1] - y[:, 2] + x[:, 3])
+    if size_lock > 0.0 and rest is not None:
+        # pull the square's *size* toward the local target edge length too, so
+        # one term delivers both squareness and even quad areas
+        mag = np.sqrt(ar * ar + ai * ai)
+        want = rest[quads].mean(axis=1) * (0.5 * np.sqrt(2.0))
+        newmag = (1.0 - size_lock) * mag + size_lock * want
+        sc = newmag / np.maximum(mag, 1e-14)
+        ar = ar * sc
+        ai = ai * sc
+    zx = np.stack([ar, -ai, -ar, ai], axis=1)      # Re(a * i**k)
+    zy = np.stack([ai, ar, -ai, -ar], axis=1)      # Im(a * i**k)
+    tgt = (c[:, None, :] + zx[:, :, None] * u[:, None, :]
+           + zy[:, :, None] * w[:, None, :])
+    for k in range(4):
+        idx = quads[ok, k]
+        for cc in range(3):
+            acc[:, cc] += np.bincount(idx, weights=tgt[ok, k, cc], minlength=n)
+        cnt += np.bincount(idx, minlength=n)
+    return acc, cnt
+
+
+def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
+                w_square=W_SQUARE, w_even=W_EVEN, w_lap=W_LAPLACE,
+                step=REGULARIZE_STEP, max_drift=MAX_DRIFT,
+                size_lock=SIZE_LOCK, rest_smooth=REST_SMOOTH,
+                rest_rho=REST_RHO, project_every=PROJECT_EVERY,
+                tol=REGULARIZE_TOL, uncapped=None):
+    """Quad fairing: even edge lengths + square corners, on the surface.
+
+    Each iteration blends three tangential pulls - a best-fit-square target
+    per quad, a spring that drives every incident edge toward the vertex's own
+    mean edge length (scale free, so it never fights the density field), and a
+    light umbrella term - then reprojects onto the input surface.  Creases,
+    boundaries and pins are frozen and total drift is capped relative to the
+    local ``rho`` so sculpted detail cannot wash out.
+    """
     if iters <= 0 or len(faces) == 0:
         return P
+    n = len(P)
     tris, quads = _tri_quad_arrays(faces)
     pairs = []
     for f in faces:
@@ -1646,33 +1736,92 @@ def _relax(P, faces, frozen, projector, rho_v, iters=4, step=0.5,
     e = np.asarray(pairs, dtype=np.int64)
     src = np.concatenate([e[:, 0], e[:, 1]])
     dst = np.concatenate([e[:, 1], e[:, 0]])
-    n = len(P)
     deg = np.maximum(np.bincount(src, minlength=n).astype(np.float64), 1.0)
+
+    Nv = None
+    P0 = P.copy()
     P = P.copy()
     move = ~frozen
     if not move.any():
         return P
     midx = np.nonzero(move)[0]
-    for _ in range(iters):
-        Pd = P[dst]
-        acc = np.empty((n, 3))
-        for c in range(3):
-            acc[:, c] = np.bincount(src, weights=Pd[:, c], minlength=n)
-        acc /= deg[:, None]
-        delta = acc - P
-        Nv = _vertex_normals_poly(P, tris, quads, n)
+    drift_cap = max_drift * rho_v
+    step_cap = step * 1.5 * rho_v
+
+    for _it in range(iters):
+        do_proj = (projector is not None
+                   and (_it % project_every == 0 or _it == iters - 1))
+        d = P[dst] - P[src]
+        L = np.sqrt(np.einsum("ij,ij->i", d, d))
+        Ls = np.maximum(L, 1e-14)
+        # The rest length must be a *smooth* field.  Using each vertex's own
+        # mean incident length makes a locally-uniform-but-oversized patch a
+        # fixed point, which is precisely the 2x quad-size jitter the fairing
+        # is supposed to remove; diffusing it (and anchoring to the density
+        # field rho) is what actually equalises quad areas.
+        rest = np.bincount(src, weights=L, minlength=n) / deg
+        for _ in range(rest_smooth):
+            acc_r = np.bincount(src, weights=rest[dst], minlength=n) / deg
+            rest = 0.5 * (rest + acc_r)
+        if rest_rho > 0.0:
+            mr = float(np.mean(rho_v))
+            anchor = rho_v * (float(np.mean(L)) / mr) if mr > 1e-14 else rest
+            rest = (1.0 - rest_rho) * rest + rest_rho * anchor
+
+        delta = np.zeros((n, 3))
+        wsum = float(w_even + w_lap + w_square) or 1.0
+        if w_even:
+            f = d * (1.0 - rest[src] / Ls)[:, None]
+            ev = np.empty((n, 3))
+            for c in range(3):
+                ev[:, c] = np.bincount(src, weights=f[:, c], minlength=n)
+            delta += w_even * (ev / deg[:, None])
+        if w_lap:
+            lap = np.empty((n, 3))
+            Pd = P[dst]
+            for c in range(3):
+                lap[:, c] = np.bincount(src, weights=Pd[:, c], minlength=n)
+            delta += w_lap * (lap / deg[:, None] - P)
+        if w_square and len(quads):
+            acc, cnt = _square_targets(P, quads, n, rest=rest,
+                                       size_lock=size_lock)
+            has = cnt > 0
+            sq = np.zeros((n, 3))
+            sq[has] = acc[has] / cnt[has][:, None] - P[has]
+            delta += w_square * sq
+        # convex blend: summing the terms would scale the effective step with
+        # the weights and diverge
+        delta /= wsum
+
+        # tangential only - the normal component is the projector's job.
+        # Normals drift slowly, so they are refreshed on the projection beat.
+        if Nv is None or do_proj:
+            Nv = _vertex_normals_poly(P, tris, quads, n)
         delta -= Nv * _dot(delta, Nv)[:, None]
-        cand = P[midx] + step * delta[midx]
-        if projector is not None:
+
+        dl = np.sqrt(np.einsum("ij,ij->i", delta, delta))
+        scl = np.minimum(1.0, step_cap / np.maximum(dl, 1e-18))
+        cand = P[midx] + step * delta[midx] * scl[midx][:, None]
+        if do_proj:
             cand = projector.project(cand)
-        d = cand - P[midx]
-        dl = np.sqrt(np.einsum("ij,ij->i", d, d))
-        good = dl <= 0.75 * rho_v[midx]
+        # keep every vertex within max_drift * rho of where extraction put it
+        dr = cand - P0[midx]
+        drl = np.sqrt(np.einsum("ij,ij->i", dr, dr))
+        cap = drift_cap[midx]
         if uncapped is not None:
-            good |= uncapped[midx]
+            cap = np.where(uncapped[midx], np.inf, cap)
+        over = drl > cap
+        if over.any():
+            fac = (cap[over] / np.maximum(drl[over], 1e-18))[:, None]
+            cand[over] = P0[midx[over]] + dr[over] * fac
+            if do_proj:
+                cand[over] = projector.project(cand[over])
         Pn = P.copy()
-        Pn[midx[good]] = cand[good]
+        Pn[midx] = cand
+        shift = np.abs(cand - P[midx]).max(axis=1) / np.maximum(rho_v[midx], EPS)
         P = Pn
+        if do_proj and float(shift.max()) < tol:
+            break
     return P
 
 
@@ -1680,8 +1829,8 @@ def _relax(P, faces, frozen, projector, rho_v, iters=4, step=0.5,
 # core
 # --------------------------------------------------------------------------
 
-def _extract_core(O, Q, N, rho, edges, bnd_verts=None, relax_iters=4,
-                  projector=None):
+def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
+                  pin_verts=None, reg=None, quad_floor=QUAD_FLOOR):
     n = O.shape[0]
     edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
     if len(edges) == 0:
@@ -1700,6 +1849,11 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, relax_iters=4,
         cbnd[cluster[np.asarray(bnd_verts, dtype=bool)]] = True
     else:
         cbnd = np.zeros(nc, dtype=bool)
+    # creases pin the lattice but are *not* mesh boundaries: they must not be
+    # filled around, yet they must not be smoothed across either
+    cpin = np.zeros(nc, dtype=bool)
+    if pin_verts is not None and np.any(pin_verts):
+        cpin[cluster[np.asarray(pin_verts, dtype=bool)]] = True
 
     cycles = _rotation_faces(CP, CN, CQ, ce, nc, cbnd)
     if not cycles:
@@ -1741,12 +1895,24 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, relax_iters=4,
                   ("injective", _make_injective),
                   ("doublets", lambda fl: _remove_doublets(P, fl))]
         if do_merge:
-            # well-shaped cancellations first, then take what is left
+            # Short, well-shaped cancellations first.  Every step of an
+            # annihilation walk distorts the quads it passes through and the
+            # final fusion leaves a valence-3 pair, so a depth-16 walk costs
+            # real mesh evenness - escalate the walk length only while the
+            # quad ratio is still short of the gate.
+            def _stage(fl):
+                for depth, mq in ((2, 0.10), (2, -1.0), (4, -1.0)):
+                    fl = _annihilate_triangles(P, fl, max_depth=depth,
+                                               min_quality=mq)
+                for depth in (8, 16):
+                    nq = sum(1 for f in fl if len(f) == 4)
+                    if nq >= quad_floor * len(fl):
+                        break
+                    fl = _annihilate_triangles(P, fl, max_depth=depth)
+                return fl
             passes += [
                 ("tripairs", lambda fl: _merge_tri_pairs(P, fl)),
-                ("annihil_q",
-                 lambda fl: _annihilate_triangles(P, fl, min_quality=0.10)),
-                ("annihil", lambda fl: _annihilate_triangles(P, fl)),
+                ("annihil", _stage),
             ]
         passes += [("dedupe2", lambda fl: _dedupe(P, fl)),
                    ("manifold2", lambda fl: _enforce_edge_manifold(P, fl)),
@@ -1781,18 +1947,35 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, relax_iters=4,
     is_new = np.zeros(npt, dtype=bool)
     if npt > nc:
         is_new[nc:] = True
+    if npt > nc:
+        cpin_full = np.concatenate([cpin, np.zeros(npt - nc, dtype=bool)])
+    else:
+        cpin_full = cpin
     if projector is not None:
-        frozen = cbnd_full.copy()
-        P = _relax(P, faces, frozen, projector, crho_full, iters=relax_iters,
-                   uncapped=is_new)
-        free = np.nonzero(~frozen)[0]
-        if len(free):
-            moved = projector.project(P[free])
-            d = moved - P[free]
-            dl = np.sqrt(np.einsum("ij,ij->i", d, d))
-            ok = (dl <= 0.75 * crho_full[free]) | is_new[free]
-            P = P.copy()
-            P[free[ok]] = moved[ok]
+        frozen = cbnd_full | cpin_full
+        r = dict(reg or {})
+        P = _regularize(P, faces, frozen, projector, crho_full,
+                        iters=int(r.get("regularize_iters", REGULARIZE_ITERS)),
+                        w_square=float(r.get("w_square", W_SQUARE)),
+                        w_even=float(r.get("w_even", W_EVEN)),
+                        w_lap=float(r.get("w_laplace", W_LAPLACE)),
+                        step=float(r.get("regularize_step", REGULARIZE_STEP)),
+                        max_drift=float(r.get("max_drift", MAX_DRIFT)),
+                        size_lock=float(r.get("size_lock", SIZE_LOCK)),
+                        rest_smooth=int(r.get("rest_smooth", REST_SMOOTH)),
+                        rest_rho=float(r.get("rest_rho", REST_RHO)),
+                        project_every=int(r.get("project_every",
+                                                PROJECT_EVERY)),
+                        tol=float(r.get("regularize_tol", REGULARIZE_TOL)),
+                        uncapped=is_new)
+        # Everything gets a final snap to the surface - including the frozen
+        # crease/boundary vertices, which never move during fairing but still
+        # start life on a tangent plane rather than on the mesh itself.
+        moved = projector.project(P)
+        d = moved - P
+        dl = np.sqrt(np.einsum("ij,ij->i", d, d))
+        ok = (dl <= 0.75 * crho_full) | is_new
+        P = np.where(ok[:, None], moved, P)
 
     # ---- compact ---------------------------------------------------------
     used = np.zeros(len(P), dtype=bool)
@@ -1819,7 +2002,7 @@ def extract_quads(O, Q, N, rho, edges, min_cycle=3, max_cycle=6,
     point does not receive the input triangles.
     """
     return _extract_core(O, Q, N, rho, np.asarray(edges), bnd_verts=bnd_verts,
-                         projector=None, relax_iters=0)
+                         projector=None)
 
 
 def extract(V, F, sol, params=None):
@@ -1829,8 +2012,10 @@ def extract(V, F, sol, params=None):
     a repaired quad-dominant mesh ``(VQ (k,3) float64, FQ list[3|4-tuples])``.
 
     Recognised ``params`` keys: ``target_faces``, ``seed``, ``sharp_edges``,
-    ``preserve_boundaries``, ``pos_iters``, ``relax_iters``, ``attempts``,
-    ``project``.
+    ``preserve_boundaries``, ``pos_iters``, ``attempts``, ``project``, and the
+    fairing knobs ``regularize_iters`` / ``regularize_step`` / ``w_square`` /
+    ``w_even`` / ``w_laplace`` / ``size_lock`` / ``rest_smooth`` / ``rest_rho``
+    / ``project_every`` / ``max_drift`` / ``quad_floor``.
     """
     p = dict(params or {})
     V = np.ascontiguousarray(np.asarray(V, dtype=np.float64).reshape(-1, 3))
@@ -1954,7 +2139,9 @@ def extract(V, F, sol, params=None):
         _lap("positions")
         VQ, FQ = _extract_core(O, Q, N, rho * scale, edges,
                                bnd_verts=bnd_verts, projector=projector,
-                               relax_iters=int(p.get("relax_iters", 4)))
+                               pin_verts=pin_mask, reg=p,
+                               quad_floor=float(p.get("quad_floor",
+                                                      QUAD_FLOOR)))
         _lap("extract_core")
         nf = len(FQ)
         nq = sum(1 for f in FQ if len(f) == 4)
