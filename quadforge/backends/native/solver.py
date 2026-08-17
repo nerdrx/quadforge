@@ -214,7 +214,7 @@ def solve(V, F, params=None):
             sol = _f2.solve_fields(V, F, p2)
             # feature-density boost: thin rims and creases need denser quads
             # than flat regions or their silhouettes alias into jagged steps
-            fb = float(p2.get("feature_density", 1.5))
+            fb = float(p2.get("feature_density", 2.5))
             if fb > 1.0 and sharp_in is not None and len(sharp_in):
                 near = np.zeros(V.shape[0], dtype=bool)
                 near[np.unique(sharp_in)] = True

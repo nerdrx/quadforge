@@ -133,6 +133,27 @@ FEATURE_MAX_DRIFT = 0.6
 FEATURE_MIN_SEGS = 3
 FEATURE_MIN_LEN = 2.0
 FEATURE_CORNER_SPAN = 3
+# The detected feature polyline hops between triangulation vertices, so it
+# zigzags at tessellation scale.  Snapping output chains onto it with perfect
+# fidelity reproduces that zigzag, so the TARGET curve is faired first: uniform
+# arc-length resample + Laplacian along the curve, held within this fraction of
+# the local rho of the raw polyline so the rim shape survives.
+FEATURE_FAIR_ITERS = 12
+FEATURE_FAIR_LAMBDA = 0.5
+FEATURE_FAIR_DRIFT = 0.35
+FEATURE_RESAMPLE = 0.5
+# a detection dropout this many mesh edges wide is bridged so a rim does not
+# alternate faired / unfaired sections
+# Bridging detection dropouts is implemented but OFF by default: measured on
+# the Dinasty head it joins chains the sculpt did not intend, and the faired
+# chain turning angle got worse (median 9.2 -> 10.8, p95 29.3 -> 39.2).  Set
+# params["feature_bridge"]=True to enable.
+FEATURE_BRIDGE = False
+FEATURE_BRIDGE_GAP = 3.0
+FEATURE_BRIDGE_COS = 0.5
+# output vertices this close to the feature curve join its chain even if the
+# collapse never gave them a pinned input sample
+FEATURE_CAPTURE = 0.25
 
 __all__ = ["extract", "extract_quads", "make_solution"]
 
@@ -281,6 +302,242 @@ def _feature_corners(V, segs, n, fdeg, corner_deg=120.0, span=3):
         if float(e0 @ e1) / (l0 * l1) > -lim:
             corner[v] = True
     return corner
+
+
+def _bridge_feature_gaps(V, segs, indptr, indices, rho, gap=FEATURE_BRIDGE_GAP,
+                         min_cos=FEATURE_BRIDGE_COS, max_hops=32):
+    """Close short dropouts in the detected feature curve.
+
+    A rim whose dihedral dips under the detection threshold for a few edges
+    arrives as two chains with loose ends, so the rim alternates faired and
+    unfaired sections.  The search is bounded by *distance* (a multiple of the
+    local rho), not by hop count: the mesh is adaptively refined before this
+    runs, so a fixed hop budget reaches a different physical distance in every
+    region and never fired at all on dense sculpt detail.
+    """
+    segs = np.asarray(segs, dtype=np.int64).reshape(-1, 2)
+    if not len(segs):
+        return segs
+    adj = {}
+    for a, b in segs:
+        adj.setdefault(int(a), []).append(int(b))
+        adj.setdefault(int(b), []).append(int(a))
+    ends = sorted(v for v, l in adj.items() if len(l) == 1)
+    if len(ends) < 2:
+        return segs
+    endset = set(ends)
+    feat = set(adj)
+
+    def tangent(v):
+        d = V[v] - V[adj[v][0]]
+        ln = np.linalg.norm(d)
+        return d / ln if ln > 1e-15 else None
+
+    used = set()
+    added = []
+    for a in ends:
+        if a in used:
+            continue
+        ta = tangent(a)
+        if ta is None:
+            continue
+        budget = gap * float(rho[a])
+        prev = {a: -1}
+        dist = {a: 0.0}
+        frontier = [a]
+        found = None
+        for _hop in range(max_hops):
+            nxt = []
+            for u in frontier:
+                du = dist[u]
+                for k in range(indptr[u], indptr[u + 1]):
+                    w = int(indices[k])
+                    dw = du + float(np.linalg.norm(V[w] - V[u]))
+                    if dw > budget or w in prev:
+                        continue
+                    prev[w] = u
+                    dist[w] = dw
+                    if w in endset:
+                        if w != a and w not in used:
+                            found = w
+                            break
+                        continue
+                    if w in feat:
+                        continue
+                    nxt.append(w)
+                if found is not None:
+                    break
+            if found is not None or not nxt:
+                break
+            frontier = nxt
+        if found is None:
+            continue
+        b = found
+        tb = tangent(b)
+        if tb is None:
+            continue
+        d = V[b] - V[a]
+        ln = np.linalg.norm(d)
+        if ln < 1e-15:
+            continue
+        d = d / ln
+        # both chains must run *into* the gap
+        if float(-ta @ d) < min_cos or float(tb @ d) < min_cos:
+            continue
+        path = [b]
+        while path[-1] != a:
+            path.append(prev[path[-1]])
+        for i in range(len(path) - 1):
+            u, w = path[i], path[i + 1]
+            added.append((min(u, w), max(u, w)))
+        used.add(a)
+        used.add(b)
+    if not added:
+        if _DEBUG:
+            print("   [bridge] loose ends=%d bridged=0" % len(ends))
+        return segs
+    out = np.unique(np.concatenate(
+        [segs, np.asarray(added, dtype=np.int64)], axis=0), axis=0)
+    if _DEBUG:
+        print("   [bridge] loose ends=%d bridged pairs=%d segments %d -> %d"
+              % (len(ends), len(used) // 2, len(segs), len(out)))
+    return out
+
+
+def _feature_chains(segs, corner):
+    """Split the feature graph into polylines at corners and junctions.
+
+    Returns a list of ``(vertex list, closed?)``.
+    """
+    adj = {}
+    for a, b in segs:
+        adj.setdefault(int(a), []).append(int(b))
+        adj.setdefault(int(b), []).append(int(a))
+    done = set()
+
+    def key(u, v):
+        return (u, v) if u < v else (v, u)
+
+    def walk(start, first):
+        chain = [start]
+        prev, cur = start, first
+        while True:
+            done.add(key(prev, cur))
+            chain.append(cur)
+            if cur == start:
+                return chain
+            if corner[cur] or len(adj[cur]) != 2:
+                return chain
+            nxt = [w for w in adj[cur] if w != prev]
+            if not nxt:
+                return chain
+            prev, cur = cur, nxt[0]
+
+    chains = []
+    for v in sorted(x for x in adj if corner[x] or len(adj[x]) != 2):
+        for nb in sorted(adj[v]):
+            if key(v, nb) in done:
+                continue
+            chains.append((walk(v, nb), False))
+    for v in sorted(adj):                       # leftovers are closed loops
+        for nb in sorted(adj[v]):
+            if key(v, nb) in done:
+                continue
+            c = walk(v, nb)
+            if len(c) > 1 and c[0] == c[-1]:
+                chains.append((c[:-1], True))
+            else:
+                chains.append((c, False))
+    return chains
+
+
+def _resample_polyline(P, R, h, closed):
+    """Uniform arc-length resample of a polyline (carrying a scalar R)."""
+    Q = np.concatenate([P, P[:1]], axis=0) if closed else P
+    seg = np.linalg.norm(np.diff(Q, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(cum[-1])
+    if total < 1e-15 or h <= 0.0:
+        return P.copy(), R.copy()
+    if closed:
+        m = max(4, int(round(total / h)))
+        t = np.linspace(0.0, total, m, endpoint=False)
+    else:
+        m = max(2, int(round(total / h)) + 1)
+        t = np.linspace(0.0, total, m)
+    Rr = np.concatenate([R, R[:1]]) if closed else R
+    out = np.empty((len(t), 3))
+    for c in range(3):
+        out[:, c] = np.interp(t, cum, Q[:, c])
+    return out, np.interp(t, cum, Rr)
+
+
+def _fair_feature_curves(V, segs, rho, corner,
+                         iters=FEATURE_FAIR_ITERS, lam=FEATURE_FAIR_LAMBDA,
+                         drift=FEATURE_FAIR_DRIFT, resample=FEATURE_RESAMPLE):
+    """Smoothed snap target for the output feature chains.
+
+    Each chain is resampled to uniform arc length, then Laplacian-smoothed with
+    corners and endpoints held.  Every sample is kept within ``drift * rho`` of
+    where it started - and it started *on* the raw polyline - so the smoothed
+    curve provably never leaves a ``drift * rho`` tube around the input feature.
+    """
+    segs = np.asarray(segs, dtype=np.int64).reshape(-1, 2)
+    if not len(segs):
+        return None, None, {}
+    chains = _feature_chains(segs, corner)
+    pts = []
+    out = []
+    base = 0
+    worst = 0.0
+    nsample = 0
+    for chain, closed in chains:
+        idx = np.asarray(chain, dtype=np.int64)
+        if len(idx) < 2:
+            continue
+        P = V[idx]
+        R = rho[idx]
+        seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+        seg = seg[seg > 1e-15]
+        if not len(seg):
+            continue
+        h = min(float(np.median(seg)), resample * float(np.mean(R)))
+        Q, Rq = _resample_polyline(P, R, h, closed)
+        k = len(Q)
+        if k >= 3:
+            Q0 = Q.copy()
+            cap = drift * Rq
+            for _ in range(iters):
+                if closed:
+                    lap = 0.5 * (np.roll(Q, 1, axis=0) + np.roll(Q, -1, axis=0)) - Q
+                else:
+                    lap = np.zeros_like(Q)
+                    lap[1:-1] = 0.5 * (Q[:-2] + Q[2:]) - Q[1:-1]
+                Q = Q + lam * lap
+                d = Q - Q0
+                dl = np.sqrt(np.einsum("ij,ij->i", d, d))
+                over = dl > cap
+                if over.any():
+                    Q[over] = Q0[over] + d[over] * (
+                        cap[over] / np.maximum(dl[over], 1e-18))[:, None]
+            dl = np.linalg.norm(Q - Q0, axis=1) / np.maximum(Rq, EPS)
+            worst = max(worst, float(dl.max()))
+            nsample += k
+        pts.append(Q)
+        e = np.stack([np.arange(k - 1), np.arange(1, k)], axis=1) + base
+        if closed:
+            e = np.concatenate([e, [[base + k - 1, base]]], axis=0)
+        out.append(e)
+        base += k
+    if not pts:
+        return None, None, {}
+    FV = np.concatenate(pts, axis=0)
+    FS = np.concatenate(out, axis=0).astype(np.int64)
+    info = dict(chains=len(chains), samples=nsample, max_drift_rho=worst)
+    if _DEBUG:
+        print("   [fair-target] chains=%d samples=%d max drift=%.3f rho"
+              % (len(chains), nsample, worst))
+    return FV, FS, info
 
 
 def _filter_feature_fragments(V, segs, rho, min_segs=FEATURE_MIN_SEGS,
@@ -1760,6 +2017,23 @@ def _vertex_normals_poly(P, tris, quads, n):
     return normalize(N)
 
 
+def _turn_report(tag, P, nb, move):
+    """Turning angle along the faired chains (exact indices, no proxy)."""
+    idx = np.nonzero(move)[0]
+    if len(idx) < 3:
+        print("   [turn] %s n<3" % tag)
+        return
+    e0 = P[idx] - P[nb[idx, 0]]
+    e1 = P[nb[idx, 1]] - P[idx]
+    l0 = np.sqrt(np.einsum("ij,ij->i", e0, e0))
+    l1 = np.sqrt(np.einsum("ij,ij->i", e1, e1))
+    ok = (l0 > 1e-15) & (l1 > 1e-15)
+    c = np.einsum("ij,ij->i", e0[ok], e1[ok]) / (l0[ok] * l1[ok])
+    a = np.degrees(np.arccos(np.clip(c, -1.0, 1.0)))
+    print("   [turn] %s n=%d median=%.2f p95=%.2f max=%.2f"
+          % (tag, len(a), np.median(a), np.percentile(a, 95), a.max()))
+
+
 def _build_chains(faces, pinned, P, corner_pts, rho_v):
     """Feature chains through the pinned output vertices.
 
@@ -2030,7 +2304,8 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
 
 def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
                   pin_verts=None, reg=None, quad_floor=QUAD_FLOOR,
-                  feat_proj=None, corner_pts=None, sym_axes=None):
+                  feat_proj=None, corner_pts=None, sym_axes=None,
+                  feat_capture=FEATURE_CAPTURE):
     n = O.shape[0]
     edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
     if len(edges) == 0:
@@ -2160,6 +2435,17 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
         cpin_full = cpin
     if projector is not None:
         frozen = cbnd_full | cpin_full
+        if feat_proj is not None and feat_capture > 0.0:
+            # A vertex can land on the rim without its cluster having captured
+            # any pinned input sample; it then gets surface-faired, wanders off
+            # the feature and kinks the chain.  Anything already sitting within
+            # a narrow band of the feature curve joins the chain instead.
+            dfe = np.linalg.norm(feat_proj.project(P) - P, axis=1)
+            near = dfe < feat_capture * crho_full
+            if _DEBUG:
+                print("   [capture] pinned=%d + geometric=%d"
+                      % (int(frozen.sum()), int((near & ~frozen).sum())))
+            frozen = frozen | near
         r = dict(reg or {})
         chain_nb, chain_move, snap_i, snap_p = _build_chains(
             faces, frozen, P, corner_pts, crho_full)
@@ -2169,6 +2455,7 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
         if _DEBUG:
             print("   [chains] pinned=%d faired=%d corner_anchors=%d"
                   % (int(frozen.sum()), int(chain_move.sum()), len(snap_i)))
+            _turn_report("chain BEFORE", P, chain_nb, chain_move)
         P = _regularize(P, faces, frozen, projector, crho_full,
                         iters=int(r.get("regularize_iters", REGULARIZE_ITERS)),
                         w_square=float(r.get("w_square", W_SQUARE)),
@@ -2188,6 +2475,8 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
                         chain_drift=float(r.get("feature_max_drift",
                                                 FEATURE_MAX_DRIFT)),
                         sym_axes=sym_axes)
+        if _DEBUG:
+            _turn_report("chain AFTER ", P, chain_nb, chain_move)
         # Everything gets a final snap to the surface - including the frozen
         # crease/boundary vertices, which never move during fairing but still
         # start life on a tangent plane rather than on the mesh itself.
@@ -2334,6 +2623,12 @@ def extract(V, F, sol, params=None):
             V, sharp, float(np.mean(rho)),
             min_segs=int(p.get("feature_min_segs", FEATURE_MIN_SEGS)),
             min_len=float(p.get("feature_min_len", FEATURE_MIN_LEN)))
+        # bridge only AFTER the noise stubs are gone - joining stubs just
+        # manufactures more spurious chains and corners
+        if len(sharp) and p.get("feature_bridge", FEATURE_BRIDGE):
+            sharp = _bridge_feature_gaps(
+                V, sharp, indptr, indices, rho,
+                gap=float(p.get("feature_bridge_gap", FEATURE_BRIDGE_GAP)))
     pin_list = []
     if sharp is not None and len(sharp):
         pin_list.append(sharp)
@@ -2385,7 +2680,18 @@ def extract(V, F, sol, params=None):
     feat_proj = None
     corner_pts = None
     if len(feat_segs):
-        feat_proj = _Projector(V, feat_segs)
+        # snap target = the FAIRED feature curve, not the raw polyline
+        FV, FS, _fi = (_fair_feature_curves(
+            V, feat_segs, rho, pin_corner,
+            iters=int(p.get("feature_fair_iters", FEATURE_FAIR_ITERS)),
+            lam=float(p.get("feature_fair_lambda", FEATURE_FAIR_LAMBDA)),
+            drift=float(p.get("feature_fair_drift", FEATURE_FAIR_DRIFT)),
+            resample=float(p.get("feature_resample", FEATURE_RESAMPLE)))
+            if p.get("feature_fair", True) else (None, None, {}))
+        if FV is not None:
+            feat_proj = _Projector(FV, FS)
+        else:
+            feat_proj = _Projector(V, feat_segs)
         if np.any(pin_corner):
             corner_pts = V[pin_corner]
     sym = p.get("symmetry") or ()
@@ -2415,7 +2721,9 @@ def extract(V, F, sol, params=None):
                                quad_floor=float(p.get("quad_floor",
                                                       QUAD_FLOOR)),
                                feat_proj=feat_proj, corner_pts=corner_pts,
-                               sym_axes=sym_axes)
+                               sym_axes=sym_axes,
+                               feat_capture=float(p.get("feature_capture",
+                                                        FEATURE_CAPTURE)))
         _lap("extract_core")
         nf = len(FQ)
         nq = sum(1 for f in FQ if len(f) == 4)
