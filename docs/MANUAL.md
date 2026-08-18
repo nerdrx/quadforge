@@ -3,7 +3,7 @@
 QuadForge turns any mesh into a clean quad mesh and carries your UVs,
 materials, vertex groups and shape keys onto the new topology.
 
-This manual documents **v0.4.8**. Everything below was checked against the
+This manual documents **v0.5.4**. Everything below was checked against the
 code, so where a number appears (a default, a threshold, a clamp) it is the
 number the addon actually uses.
 
@@ -62,9 +62,11 @@ showing the preset name as a label. It is a starting point, not a mode.
 
 **What no preset ever touches**: the whole *Preserve* box (Boundaries, UVs,
 Vertex Groups, Shape Keys, Materials, Creases, Bevel Weights), *Keep Original*,
-*Seed*, *Small Shell Limit*, *Hang-Safe Solver*, the guide collection and the
-LOD targets. Those either protect your data or protect your Blender session,
-and a workflow preset has no business flipping them.
+*Seed*, *Small Shell Limit*, *Hang-Safe Solver*, *Opening Rings*, the guide
+collection and the LOD targets. Those either protect your data, protect your
+Blender session, or (in the case of Opening Rings) reallocate your quad budget
+in a way you should be choosing deliberately — a workflow preset has no
+business flipping them.
 
 Notes on individual choices:
 
@@ -154,9 +156,11 @@ is clamped to 0.05 … 4.0.
 
 ### Edge Loops
 
-Everything in this box does the same thing mechanically — it marks edges on the
+Most of this box does the same thing mechanically — it marks edges on the
 working copy as **hard**, which both backends treat as a feature the edge flow
-must follow. They differ only in where the marks come from.
+must follow, and the settings differ only in where the marks come from. The
+last two, *Opening Rings* and *Use Guides*, are different in kind: they steer
+the Native solver's orientation field directly.
 
 #### Detect Hard Edges — `detect_hard_edges` (default on)
 Marks edges whose dihedral angle exceeds *Hard Edge Angle*. Non-manifold edges
@@ -186,34 +190,50 @@ source object is already textured and you intend to keep the texture — without
 it, the UV transfer still runs, but island borders can end up cutting across
 quads diagonally.
 
-#### Ring Openings — `use_opening_rings` (default off, Native only)
+#### Opening Rings — `use_opening_rings` (default off, Native only)
 Runs concentric edge loops around small closed holes — eye sockets, the rim of
 a mouth bag, ear canals — instead of letting the curvature-aligned flow run
 straight past them. QuadForge finds every closed boundary loop shorter than
 15 % of the perimeter of a square patch with the same surface area as the mesh
-(so large open borders and the symmetry-bisect cut are skipped), and steers the
-orientation field along that loop's offset rings over a band roughly six quads
-wide, at full strength for the first two. Hand-drawn guides and hard edges
-still win wherever they overlap the band, and the rim edges themselves are
-pinned as before. **Native backend only** — QuadriFlow has no channel to
-receive this. Off by default.
+(so large open borders and the symmetry-bisect cut are skipped), then does
+three things around each one: steers the orientation field along that loop's
+offset rings over a band roughly six quads wide, **refines the mesh inside that
+band** so a ring has enough segments to be a ring rather than a polygon, and
+pins the first offset loop about 1.5 quads out so it exists as a real edge run
+rather than by luck. Hand-drawn guides and hard edges still win wherever they
+overlap the band, and the rim edges themselves are pinned as before. **Native
+backend only** — QuadriFlow has no channel to receive any of this. Off by
+default, and no preset turns it on.
+
+**It spends quads, but not extra ones.** The refinement is budget-conserving:
+the socket's new quads are paid for by the rest of the mesh going marginally
+coarser (about 2 % on a typical head), not by a bigger face count — face counts
+were measured within ±2 % of target at budgets from 1 500 to 12 500. The
+bands together can never claim more than 30 % of the budget, so a mesh with two
+hundred little tubes cannot starve its own body. Expect quad sizes to vary more
+across the mesh than with the option off; that is the feature working.
 
 Measured on a disc with a hole and a sphere with a hole, the edges inside a
-four-quad band go from 15–21° off the ring direction to 7–9°. On a real head
-the deciding factor is not the field but the budget: at 12 000 faces for a
-whole body an eye socket is only about a dozen quads around, which is not
-enough room for a second and third loop to read at all, while at **25 000+**
-the same solve visibly carries concentric arcs under the lids. So: turn it on
-for head-only remeshes and for character budgets from roughly 25k up; leave it
-off for game-budget full-body passes, where it costs a little time and changes
-nothing you can see.
+four-quad band go from 15–21° off the ring direction to 4–6°. On a real avatar
+head at a 12 000-face whole-body budget, the quads around an eye socket go from
+25 to 46 and the first three rings go from mostly broken (loop purity
+0.54 / 0.26 / 0.23) to mostly closed (0.71 / 0.65 / 0.61) — the topology
+clearly acknowledges the eye. More budget still means cleaner rings, but you no
+longer need a head-only or 25k+ remesh for it to do anything. It remains
+experimental: roughly one ring vertex in three is still a T-junction, so this
+is not hand-drawn lid topology.
 
-One caveat worth knowing before you judge it: if the eyes, mouth bag or ear
-pieces are **separate small shells**, *Keep Small Shells* sets them aside
+**If nothing happens, look at Keep Small Shells first.** If the eyes, mouth bag
+or ear pieces are separate small shells, *Keep Small Shells* sets them aside
 untouched and their openings never reach the solver — on a typical avatar head
-most of the holes are in that category. If you want them ringed, they have to
-be part of the shell being solved (or *Keep Small Shells* has to be off, which
-is usually a worse trade).
+most of the holes are exactly that (on the author's test avatar, 13 of 15).
+QuadForge now counts both sides and says so: the report carries
+`ring_openings_preserved` and `ring_openings_solved`, and when the preserved
+side wins you get a warning naming the count (see
+[Troubleshooting](#warnings-about-your-settings)). To ring them, turn *Keep
+Small Shells* off or raise *Small Shell Limit* — bearing in mind that remeshing
+authored eyes and teeth is usually a worse trade than leaving their openings
+unringed.
 
 #### Use Guides — `use_guides` (default off) / Guide Collection — `guide_collection`
 Projects the curve and Grease Pencil objects in the guide collection onto the
@@ -465,6 +485,15 @@ Collection*, or press **New Guide**.
 curves did not project onto the surface. Guides are projected by nearest point;
 draw them on or very near the surface, and check the guide object's transform.
 
+**"Opening Rings: N of M openings sit on shells that Preserve Small Shells
+keeps verbatim, so they cannot be ringed - turn that option off (or raise Small
+Shell Limit) to ring them"**
+Exactly what it says: the eye sockets and mouth rim belong to small shells that
+are kept at their original topology, so the solver never sees those openings
+and *Opening Rings* has nothing to work on. The report also carries the raw
+counts as `ring_openings_preserved` and `ring_openings_solved`. Decide which
+you want more — authored eyes kept verbatim, or their openings ringed.
+
 **"native backend unavailable, used QuadriFlow"** — the Native module failed to
 import (a broken install, or NumPy missing from the Blender Python). Reinstall
 the addon.
@@ -494,8 +523,10 @@ From the project's own honest-limitations list (see
 - **Semantic loop placement.** Curvature alignment follows forms; it does not
   *plan* loops. Eyelid rings, mouth loops and the loops an artist would draw
   around a joint are not planned for you. Use guides, or retopologise those
-  areas by hand. *Ring Openings* is a first, partial answer for the holes
-  specifically, and needs the resolution to show it.
+  areas by hand. *Opening Rings* is a partial answer for the holes
+  specifically — it rings eye sockets and mouth rims and buys them the
+  resolution to close, but roughly one ring vertex in three is still a
+  T-junction.
 - **Thin shells are resolution-bound.** Fingers, fur cards, cloth edges below
   the target quad size will lose their silhouette. Raise the count, paint
   density there, or keep them as preserved small shells.
@@ -559,7 +590,7 @@ Feature matrix:
 | Adapt Quad Count edge-loop removal | yes | no |
 | Painted density | post-pass relaxation | in-solver |
 | Guides | auto-switches the solve to Native | full directional steering |
-| Ring Openings | no | yes (experimental) |
+| Opening Rings | no | yes (experimental) |
 | Deterministic per seed | no | yes |
 | Hang-Safe Solver applies | yes | n/a (cannot hang this way) |
 
@@ -615,7 +646,7 @@ its source.
 
 ## Defaults at a glance
 
-Verified against `quadforge/properties.py` at v0.4.8.
+Verified against `quadforge/properties.py` at v0.5.4.
 
 | Property | Default |
 |---|---|

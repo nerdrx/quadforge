@@ -39,8 +39,10 @@ max deviation 0.74% of the body diagonal):
 - **Material boundaries** become preserved edge loops
 - **Guide curves** — draw Bezier/Grease-Pencil strokes; QuadForge projects them onto the
   surface and aligns edge flow along them
-- **Ring Openings** (experimental, Native) — concentric loops around eye sockets,
-  mouth rims and ear holes instead of a grid clipped by the hole
+- **Opening Rings** (experimental, Native, opt-in) — concentric loops around eye
+  sockets, mouth rims and ear holes instead of a grid clipped by the hole, with a
+  local density boost so the rings can actually close at normal game budgets
+  (paid for by the rest of the mesh, not by a bigger face count)
 - Open-boundary preservation
 
 **Symmetry**

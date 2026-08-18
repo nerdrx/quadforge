@@ -2,7 +2,7 @@
 # Agentic Development and Adversarial Visual QA
 
 **nerdrx & Claude (Anthropic Fable 5, with parallel Opus 5 implementation agents)**
-*August 9–18, 2026 — 15 releases, ~10,700 lines, 123 automated checks*
+*August 9–18, 2026 — 22 releases, ~13,000 lines, 162 automated checks*
 
 ---
 
@@ -36,7 +36,7 @@ serious defects on real-world input.
 
 QuadForge began with a one-line user request ("write me a replacement for
 Quad Remesher, I don't wanna pay for it — self test as much as possible") and
-evolved through fifteen releases driven almost entirely by a single feedback
+evolved through twenty-two releases driven almost entirely by a single feedback
 channel: **the user looking at wireframe renders of their own hand-made
 avatars and saying what looked wrong.** Every major quality advance in this
 project traces back to one of those complaints. We consider this the paper's
@@ -142,12 +142,13 @@ project's subtlest regression).
 
 ## 4. Verification apparatus
 
-- **123 assertion checks** across 14 headless test modules (registration,
+- **162 assertion checks** across 17 headless test modules (registration,
   remeshing accuracy, symmetry exactness, sharp preservation, data transfer,
   density/guides, reporting, native gates, LODs/batch, orientation/seam
   regressions, mirrored-weight regressions, a 34-case pathological-input
-  gauntlet, UV-island following, seam-debris regressions), with crash-detecting
-  runner, per-module isolation mode, and flake-hardened assertions.
+  gauntlet, UV-island following, seam-debris regressions, the preserve-off
+  path, presets, opening rings), with crash-detecting runner, per-module
+  isolation mode, and flake-hardened assertions.
 - **A quality benchmark** (`tests/bench_native.sh`) comparing both backends on
   six procedural fixtures across: quad%, watertightness, poles/1k, count
   error, surface deviation, **flow alignment to principal curvature
@@ -272,7 +273,7 @@ instrument until the numbers explain it.
   statistically sized test sample rather than a 30-edge coin flip. The native solver is
   bit-deterministic per seed by construction, which made every regression in
   it bisectable.
-- **L6. Ship small, keep an anchor.** Fifteen releases in nine days meant
+- **L6. Ship small, keep an anchor.** Twenty-two releases in nine days meant
   every regression window was one release wide — but §5's case study shows
   windows of one are still windows. The benchmark now keeps per-version
   anchors (`abbench_*`).
@@ -285,8 +286,8 @@ repetitions, isolated-config zip installs, four end-to-end avatar/backend
 combinations with posed-rig verification, a 25-run leak soak, and
 determinism measurement.)*
 
-- Suite: **123/123**; pathological-input gauntlet 34/34 with the invariant
-  *valid mesh or clean error, never a crash or hang*.
+- Suite: **123/123** then, **162/162** at v0.5.4; pathological-input gauntlet
+  34/34 with the invariant *valid mesh or clean error, never a crash or hang*.
 - Benchmark gates: native **5/6** fixtures pass everything (the 6th requires a
   watertight Suzanne; Blender's own Suzanne has 168 boundary edges).
 - Flow alignment (median angle to principal curvature, ellipsoid): native
@@ -309,9 +310,10 @@ determinism measurement.)*
 
 What remains honestly unsolved: semantic loop placement (eyelid rings, mouth
 loops as an artist would draw them) — our curvature alignment follows forms
-but does not *plan* loops (§8 attacks the ring half of this directly, and
-stalls on resolution rather than on alignment); thin-shell silhouettes remain
-resolution-bound;
+but does not *plan* loops (§8 attacks the ring half of this directly: the
+blocker turned out to be resolution rather than alignment, and buying
+resolution locally moves it from unsolved to partly solved); thin-shell
+silhouettes remain resolution-bound;
 face-count adherence under strongly non-uniform density fields drifts
 (-15%..+1%); and Blender's QuadriFlow remains, at the deepest level, weather. (Two
 further items closed post-campaign in v0.4.7: the off-default
@@ -369,39 +371,117 @@ from a mean edge length — the mesh around an opening is exactly where a sculpt
 is finest, so a 6-quad band silently stopped at 3.7 quads and the outer half
 of it got no instruction at all.
 
-**Quantitative result.** On the two synthetic fixtures (a disc with a hole, a
-sphere with a polar hole), the median 4-RoSy angle of extracted edges inside a
-four-quad band to the true ring direction falls from **15–21° to 7.4–9.0°**,
-with no valence blow-up at the rim. The orientation field's own residual
-against the ideal ring direction inside the band is **0.04°** — so almost the
-entire remaining 7–9° is paid *after* the field, in lattice extraction and
-regularization, not in the solve.
-
-**The negative result, which is the more useful half.** On the real test
-avatar the effect could not be seen at the budget characters are actually
-remeshed at. At 12k faces a Dinasty eye socket is about **twelve quads
-around**: there is no room for a second and third concentric loop, so a
-perfectly ringed field extracts to something visually indistinguishable from
-the unringed one. At **≥25k** the same solve clearly reads — concentric arcs
-under the lower lid, a ringed nose tip. The finding, stated crisply: for
+**Stage one (v0.5.2): the instruction lands, and nothing visible happens.** On
+the two synthetic fixtures (a disc with a hole, a sphere with a polar hole) the
+median 4-RoSy angle of extracted edges inside a four-quad band to the true ring
+direction fell from 15–21° to **7.4–9.0°**, with no valence blow-up at the rim,
+and the orientation field's *own* residual against the ideal ring direction
+inside the band was **0.04°** — the field had done as it was told, essentially
+exactly. On the real avatar, at the budget characters actually ship at, the
+result was invisible. At 12k faces a Dinasty eye socket carries only a dozen to
+sixteen quads around its rim (perimeter ÷ local target edge length): a
+concentric loop made of sixteen segments, which must *also* grow its ring count
+outwards, is a lumpy polygon, and it reads as noise rather than as an eyelid.
+At **≥25k** the same solve clearly read — concentric arcs under the lower lid,
+a ringed nose tip. So the honest v0.5.2 finding was a negative one, and the
+0.04° residual is what made it diagnostic rather than merely disappointing: for
 semantic loop placement, **resolution, not alignment, is the binding
-constraint.** The field was already right at 12k; the mesh had nowhere to put
-what the field knew. That is why the feature ships off by default, and why we
-resisted the temptation to raise `ring_strength` until *something* visible
-happened — a stronger ring instruction at 12k does not buy loops, it buys
-distortion.
+constraint.** The field was already right; the mesh had nowhere to put what the
+field knew. We deliberately did not chase the symptom by raising
+`ring_strength` until *something* appeared — a stronger ring instruction at 12k
+does not buy loops, it buys distortion.
 
-Three levers follow directly from that diagnosis, and are recorded rather than
-implemented: a **density boost inside the ring band** (spend quads where the
-loops are supposed to be, exactly as the feature-density machinery of §3.4
-already does for creases); **pinning the extraction lattice lines to the first
-offset ring**, since the 0.04° residual says the field is not the lossy stage;
-and **preserved-shell interaction** — on the test avatar 7 of the 9
-openings in the head belong to small shells that `preserve_small_shells` keeps
-untouched, so the ring code never sees them at all. That last one is a
-reminder of how features interact in a pipeline that is mostly made of
-defensive exceptions: a correct feature can be measured as inert simply
-because an earlier, also-correct stage removed its input.
+**Stage two (v0.5.4): buy the resolution, locally, without buying faces.** The
+diagnosis named its own fix, and the fix is the interesting part.
+
+1. **Band density boost** (`rings.ring_density`). Every detected opening is
+   given a quota — `ring_min_quads` = 32 quads around its rim — as a
+   per-opening factor `clip(ring_min_quads · ρ_rim / perimeter, 1,
+   ring_density_max=2)`, applied over the band with the same
+   plateau-then-decay profile (1.5 / 2.5 quads) the feature-density machinery
+   of §3.4 uses, for the same reason: a hard step in ρ stitches a dense collar
+   onto a coarse interior and the seam shows up as a band of extra poles. The
+   boosted field is then **rescaled back onto the pre-boost cell budget**
+   `Σ A_v/ρ_v²`, so the socket's new quads are paid for by an interior that
+   goes about 2% coarser rather than by a larger mesh: face counts held to
+   ±2% at budgets 1560 / 3120 / 6240 / 12500, and the test asserts the
+   pre-boost budget to floating-point equality. A `ring_density_budget` = 0.30
+   cap, enforced by bisection on the boost itself, stops a head with two
+   hundred hair-strand tubes from starving everything else — measured demand
+   on the messiest real input was only 1.043–1.11, so the cap never binds; it
+   exists for the input we have not seen.
+2. **Pinned first offset loop** (`rings.ring_pin_segments`). The field solution
+   now carries its geodesic distance forward, and the extractor marches the
+   iso-contour at `ring_pin_offset` = 1.5 output quads, folds it into the sharp
+   feature list before lattice refinement, and thereby makes the first ring
+   exist *by construction* instead of by hoping alignment survives extraction.
+   Two negative results here are worth more than the feature: an unordered bag
+   of snapped segment pairs — the obvious first implementation — bought nothing
+   and visibly scarred the collar, because the extractor treats a feature
+   vertex of degree ≠ 2 as a **corner that cannot slide**, and a per-triangle
+   bag manufactures such junctions by the dozen, freezing the lattice onto the
+   staircase; walking the contour into an *ordered cycle* instead took
+   first-ring loop purity 0.70 → 0.81. And the nominal offset of 1.0 quads (the
+   place the first lattice line wants to be) is wrong because the rim is pinned
+   too: a contour a bare quad out asks for a row of cells in a strip thinner
+   than one, and on the disc fixture it duly collapsed into a valence-18 fan.
+   Hence 1.5, plus a `ring_pin_min_gap` = 0.9 guard for the contour drifting
+   inwards where the band is coarse.
+3. **Retune, which measured as "change nothing".** With density in play, the
+   widened `ring_falloff` of 8–9 that stage one had suggested is *worse* and
+   brittle — valence 19–20 on the fixtures at strength 0.6 — so 6 / plateau 2 /
+   strength 0.6 stand, and 0.6 remained the most robust of {0.6, 0.7, 0.75,
+   0.8} over six seeds × two fixtures.
+
+**Results (v0.5.4 against rings off, and against v0.5.2).**
+
+| | off | v0.5.2 | v0.5.4 |
+|---|---|---|---|
+| disc, 4-RoSy band alignment | 17.9–20.8° | 7.4–9.0° | **4.3–6.1°** |
+| sphere, 4-RoSy band alignment | 15.1–21.6° | 7.4–9.5° | **4.1–6.5°** |
+| quads around a Dinasty eye socket @12k (counted on the output) | 25 | — | **46** |
+| Dinasty loop purity, rings 1 / 2 / 3 | 0.54 / 0.26 / 0.23 | — | **0.71 / 0.65 / 0.61** |
+| max valence, 12 fixture runs | — | — | **≤ 8** |
+
+The costs are visible and small: global edge-length CV rises 0.381 → 0.436,
+which is the boost doing exactly its job (the field is deliberately less
+uniform now); eye-local quad aspect *improves* 1.43 → 1.27; quad share 98.2% →
+98.1%; wall time unchanged; and with the feature off, output is bit-identical
+to the previous release, verified by hash on three fixtures through both the
+`solve_fields`+`extract` path and the whole `solver.solve` path.
+
+**The ablation is the headline.** Splitting the two mechanisms apart: the
+density boost alone captured most of the win, while field steering alone barely
+moved the extracted result (loop purity 0.63 with steering only, against 0.54
+with the feature off). Stage one's thesis is therefore not merely restated but
+*proven constructively* — at character budgets the field already knew the
+answer, and the only thing that helped was giving it somewhere to write it. The
+generalisable form: when a correct instruction produces no visible effect,
+measure whether the medium can express it before strengthening the
+instruction.
+
+**What it is honestly not.** First-ring loop purity of ~0.71 means roughly one
+in three ring vertices is still a T-junction: the topology now clearly
+*acknowledges* the eye, which is a different claim from artist-quality lids.
+Much of the band sits on the socket's hidden inner wall rather than on the
+visible lid, and the obvious remedy — widening the profile until it reaches the
+lid — measured worse (purity 0.71 → 0.57), so it was not taken. The feature
+stays **off by default and out of every preset** (the suite asserts the preset
+exclusion), deliberately: it reallocates the user's quad budget, and a
+workflow preset has no business making that trade silently.
+
+**The fourth lever became a warning instead of a feature.** Preserved small
+shells never reach the backend, so an opening that belongs to one cannot be
+ringed however the feature is tuned — on the author's own avatar **13 of 15**
+openings are exactly that, with 2 reaching the solver. Rather than special-case
+the pipeline, `_preserved_opening_warning` counts openings on both sides of the
+split (reading the boundary straight off the Blender mesh, filtered by the same
+rule the solver uses), reports `ring_openings_preserved` /
+`ring_openings_solved`, and tells the user which knob is holding it. This is a
+general shape worth naming: in a pipeline mostly made of defensive exceptions,
+a correct feature can measure as inert because an earlier, also-correct stage
+removed its input — and the cheapest fix is usually not to remove the exception
+but to make the interaction legible to whoever ticked the box.
 
 ## 9. Conclusion
 
@@ -412,7 +492,7 @@ Instant Meshes and standard mesh-repair practice — but because the
 fixtures, real rigged assets, quantitative gates on every merge, renders in
 front of a human who owned the ground truth, and implementation agents whose
 reports were trusted precisely because they were willing to say "I measured
-my idea and it is wrong." The complete system, its 123-check suite, its
+my idea and it is wrong." The complete system, its 162-check suite, its
 benchmark, and this history are free software:
 **github.com/nerdrx/quadforge**.
 
@@ -422,7 +502,15 @@ benchmark, and this history are free software:
 robustness (hang isolation, weight-leak fix, 34-case gauntlet, T-edge repair)
 → v0.3.x workflow (Keep Small Shells, UV islands, padded symmetry) → v0.4.x
 native solver v2 (curvature fields, watertight extraction, regularization,
-feature fairing, graded density) → v0.4.6 density-regression correction.
+feature fairing, graded density) → v0.4.6 density-regression correction →
+v0.4.7 preserve-off path repaired, honest face budgets, full determinism →
+v0.4.8 face counts land on target (budget-conserving density, secant search)
+→ v0.5.0 presets, guide-constraint fix, 2.4–2.8× native speedup → v0.5.1
+QuadriFlow flag-blindness warnings (upstream defect U7) → v0.5.2 Opening
+Rings, experimental, plus the hole-filler correctness fix (§5 Q6) → v0.5.3
+guided QuadriFlow solves auto-route to the Native backend → v0.5.4 Opening
+Rings that read at a game budget (§8): band density boost, pinned first
+offset loop, preserved-opening warning.
 
 *Appendix B — Reproduction:* `./tests/run_all.sh` (full suite),
 `tests/bench_native.sh` (quality shootout), both headless against Blender
