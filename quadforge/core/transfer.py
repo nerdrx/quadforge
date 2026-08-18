@@ -12,10 +12,12 @@ The snapshot is a plain Python object holding numpy arrays only (plus material
 datablock references, which survive the mesh swap and are re-resolved by name if
 they do not).  No mesh / object / key datablock is kept alive by a Snapshot.
 
-Everything is vectorised with numpy + foreach_get / foreach_set; the only Python
-level loops are the BVH nearest-surface queries (~2.5 M queries/s) and the
-vertex-group write-back (~1.6 M weights/s), both of which are fast enough for
-multi-hundred-thousand vertex meshes.
+Everything is vectorised with numpy + foreach_get / foreach_set; the Python
+level loops are the BVH nearest-surface queries (~2.5 M queries/s), the
+vertex-group write-back (~1.6 M weights/s), the per-arc crease/bevel chain
+router and the per-corner UV clearance probes — the last two only ever walk the
+handful of edges and corners that are actually contested, and the first two are
+fast enough for multi-hundred-thousand vertex meshes.
 """
 
 from __future__ import annotations
@@ -46,6 +48,20 @@ _LOOP_INSET = 0.08
 # Two source polygons belong to the same UV region when their shared edge has
 # matching UVs on both sides (in *every* layer) to within this tolerance.
 _UV_SEAM_EPS = 1e-6
+# Above this many marked source edges the chain router gives up its per-arc
+# work and the legacy nearest-edge match takes over (a mesh where *everything*
+# is creased has no chains worth following anyway).
+_MAX_CHAIN_EDGES = 40000
+# Corridor widths (in units of the local edge scale) tried in turn when routing
+# a source chain through the output edge graph.
+_CORRIDOR_STEPS = (1.0, 1.75, 3.0)
+# Material vote: sample points per corner triangle of an output face (1..3).
+_MATERIAL_SAMPLES = 3
+# Bounded UV extrapolation: how far (UV units) island clearances are measured
+# at all.  ~20 texels on a 2K map; islands farther apart than this are simply
+# "far enough", and half of it is the most any corner may ever extrapolate.
+_UV_CLEARANCE_CAP = 0.01
+_UV_EXTRAPOLATE = True
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +210,7 @@ class Snapshot:
         self._uv_regions = None        # per-polygon UV-island id (lazy)
         self._uv_region_index = None   # (order, start, end) into snap.tris
         self._uv_region_bvh = {}       # island id -> (BVHTree, global tri ids)
+        self._uv_clearance = {}        # UV-clearance cache (layer BVHs, gaps)
 
     # -- derived ---------------------------------------------------------
     @property
@@ -223,6 +240,7 @@ class Snapshot:
     def free(self):
         self._bvh = None
         self._uv_region_bvh = {}
+        self._uv_clearance = {}
 
     def __repr__(self):
         return (
@@ -677,14 +695,15 @@ def apply(snapshot, new_obj, s=None):
     do_bw = _flag('preserve_bevel_weights')
     if (do_cr or do_bw) and ne:
         EV = _fget(me.edges, "vertices", ne * 2, 'i4').reshape(-1, 2)
+        cache = {}
         if do_cr and snapshot.crease_edge is not None:
             n_ok, n_skip = _transfer_edge_scalar(
-                snapshot, me, EV, NV, snapshot.crease_edge, CREASE_EDGE)
+                snapshot, me, EV, NV, snapshot.crease_edge, CREASE_EDGE, cache)
             rep['creases'] += n_ok
             rep['creases_skipped'] += n_skip
         if do_bw and snapshot.bweight_edge is not None:
             n_ok, n_skip = _transfer_edge_scalar(
-                snapshot, me, EV, NV, snapshot.bweight_edge, BWEIGHT_EDGE)
+                snapshot, me, EV, NV, snapshot.bweight_edge, BWEIGHT_EDGE, cache)
             rep['bevel_weights'] += n_ok
             rep['bevel_weights_skipped'] += n_skip
     if do_cr and snapshot.crease_vert is not None:
@@ -907,11 +926,12 @@ def _constrain_to_island(snap, l_tri, sample, dist, lp, starts, totals,
     alone rather than dragged across the gap.
     """
     npo = starts.size
+    none = np.zeros(lp.size, bool)
     if npo == 0 or lp.size == 0:
-        return l_tri
+        return l_tri, none
     regions = _uv_regions(snap)
     if regions.size == 0 or int(regions.max()) == 0:
-        return l_tri
+        return l_tri, none
 
     ok = l_tri >= 0
     reg = np.full(lp.size, -1, 'i4')
@@ -927,7 +947,7 @@ def _constrain_to_island(snap, l_tri, sample, dist, lp, starts, totals,
     faces = np.nonzero((rmax >= 0) & (rmin != rmax))[0]
     rep['uv_seam_faces'] = int(faces.size)
     if faces.size == 0:
-        return l_tri
+        return l_tri, none
 
     # how far a corner may travel to reach its face's island
     extent = np.zeros(npo, 'f8')
@@ -983,7 +1003,141 @@ def _constrain_to_island(snap, l_tri, sample, dist, lp, starts, totals,
                 moved[i] = True
     rep['uv_seam_corners_fixed'] = int(moved.sum())
     rep['uv_seam_faces_fixed'] = int(np.unique(lp[moved]).size)
-    return l_tri
+    return l_tri, moved
+
+
+def _uv_layer_bvh(snap, li):
+    """BVH over one UV layer's triangles, laid flat in the z=0 plane."""
+    got = snap._uv_clearance.get(('bvh', li), False)
+    if got is not False:
+        return got
+    bvh = None
+    uv = snap.uv_layers[li]['uv']
+    if snap.tris.shape[0] and uv.shape[0] == snap.nloops:
+        U = uv[snap.tri_loops].reshape(-1, 2).astype('f8')
+        V3 = np.zeros((U.shape[0], 3), 'f8')
+        V3[:, :2] = U
+        tri = np.arange(U.shape[0], dtype='i4').reshape(-1, 3)
+        try:
+            bvh = BVHTree.FromPolygons(V3.tolist(),
+                                       [tuple(t) for t in tri.tolist()],
+                                       all_triangles=True)
+        except Exception:
+            bvh = None
+    snap._uv_clearance[('bvh', li)] = bvh
+    return bvh
+
+
+def _uv_island_gap(snap, li):
+    """Per-island lower bound on the UV distance to any other island.
+
+    Island bounding boxes only: boxes ``d`` apart mean the islands themselves
+    are at least ``d`` apart, so an island whose box is already farther than the
+    cap needs no triangle-level query at all.  Skipped (all zeros, i.e. "ask the
+    triangles") on layouts with more islands than the pairwise table is worth.
+    """
+    key = ('gap', li)
+    if key in snap._uv_clearance:
+        return snap._uv_clearance[key]
+    regions = _uv_regions(snap)
+    nreg = int(regions.max()) + 1 if regions.size else 0
+    gap = np.zeros(max(nreg, 1), 'f8')
+    uv = snap.uv_layers[li]['uv']
+    if 0 < nreg <= 512 and snap.tris.shape[0] and uv.shape[0] == snap.nloops:
+        tri_region = regions[snap.tri_poly].astype('i8')
+        U = uv[snap.tri_loops].astype('f8')                # (nt,3,2)
+        mn = np.full((nreg, 2), np.inf)
+        mx = np.full((nreg, 2), -np.inf)
+        np.minimum.at(mn, tri_region, U.min(axis=1))
+        np.maximum.at(mx, tri_region, U.max(axis=1))
+        live = np.isfinite(mn).all(axis=1)
+        d = np.zeros((nreg, nreg), 'f8')
+        for ax in (0, 1):
+            sep = np.maximum(mn[:, None, ax] - mx[None, :, ax],
+                             mn[None, :, ax] - mx[:, None, ax])
+            d += np.maximum(sep, 0.0) ** 2
+        d = np.sqrt(d)
+        d[~live, :] = np.inf
+        d[:, ~live] = np.inf
+        np.fill_diagonal(d, np.inf)
+        g = d.min(axis=1)
+        gap = np.where(np.isfinite(g), g, _UV_CLEARANCE_CAP)
+    snap._uv_clearance[key] = gap
+    return gap
+
+
+def _uv_clearance(snap, li, points, own):
+    """UV-space distance from each point to the nearest *other* island.
+
+    Measured, not assumed: the whole layer's triangles are in one BVH, every
+    hit within ``_UV_CLEARANCE_CAP`` is checked against the point's own island,
+    and the nearest foreign one wins.  Points with no foreign island in range
+    keep the cap, which is a lower bound on their true clearance — so half the
+    returned value is always a displacement that provably cannot reach another
+    island's texels.
+    """
+    cap = _UV_CLEARANCE_CAP
+    n = points.shape[0]
+    out = np.full(n, cap, 'f8')
+    if n == 0:
+        return out
+    # islands whose bounding box is already farther than the cap are done
+    ask = np.nonzero(_uv_island_gap(snap, li)[own] < cap)[0]
+    if ask.size == 0:
+        return out
+    bvh = _uv_layer_bvh(snap, li)
+    if bvh is None:
+        return out * 0.0
+    regions = _uv_regions(snap)
+    tri_region = regions[snap.tri_poly]
+    rng = bvh.find_nearest_range
+    for i in ask.tolist():
+        p = points[i]
+        r0 = int(own[i])
+        best = cap
+        for hit in rng((p[0], p[1], 0.0), cap):
+            if hit is None or hit[2] is None or hit[3] is None:
+                continue
+            if int(tri_region[int(hit[2])]) == r0:
+                continue
+            d = float(hit[3])
+            if d < best:
+                best = d
+        out[i] = best
+    return out
+
+
+def _bary_free(snap, tri_idx, points):
+    """Unclamped barycentric of ``points`` projected onto their triangle plane.
+
+    Negative weights mean the point lies outside the triangle; interpolating a
+    UV with them continues the source parameterisation past the island's edge
+    instead of pinning the corner to its outline.
+    """
+    n = points.shape[0]
+    w = np.zeros((n, 3), 'f8')
+    w[:, 0] = 1.0
+    ok = tri_idx >= 0
+    if n == 0 or not ok.any():
+        return w, np.zeros(n, bool)
+    t = snap.tris[tri_idx[ok]]
+    V = snap.verts
+    a, b, c = V[t[:, 0]], V[t[:, 1]], V[t[:, 2]]
+    v0, v1, v2 = b - a, c - a, points[ok] - a
+    dot = lambda x, y: np.einsum('ij,ij->i', x, y)      # noqa: E731
+    d00, d01, d11 = dot(v0, v0), dot(v0, v1), dot(v1, v1)
+    d20, d21 = dot(v2, v0), dot(v2, v1)
+    den = d00 * d11 - d01 * d01
+    good = np.abs(den) > _EPS
+    den = np.where(good, den, 1.0)
+    vv = (d11 * d20 - d01 * d21) / den
+    ww = (d00 * d21 - d01 * d20) / den
+    sub = np.stack([1.0 - vv - ww, vv, ww], axis=1)
+    sub[~good] = (1.0, 0.0, 0.0)
+    w[ok] = sub
+    valid = np.zeros(n, bool)
+    valid[np.nonzero(ok)[0][good]] = True
+    return w, valid
 
 
 def _apply_uvs(snap, me, nl, npo, NV, rep):
@@ -1005,11 +1159,26 @@ def _apply_uvs(snap, me, nl, npo, NV, rep):
 
     l_tri, l_loc = _nearest_tris(snap, sample)
     dist = np.linalg.norm(sample - l_loc, axis=1)
-    l_tri = _constrain_to_island(snap, l_tri, sample, dist, lp, starts, totals,
-                                 centers, lco, rep)
+    l_tri, moved = _constrain_to_island(snap, l_tri, sample, dist, lp, starts,
+                                        totals, centers, lco, rep)
     l_bary = _bary(snap, l_tri, lco)
 
-    for layer in snap.uv_layers:
+    # Corners pulled onto an island can sit past its edge; their barycentric is
+    # then clamped to the island's outline and the UV pins to the island hull.
+    # Those are the only corners allowed to extrapolate, and only as far as the
+    # measured clearance to the neighbouring island permits (see _uv_clearance).
+    ext = np.zeros(nl, bool)
+    if _UV_EXTRAPOLATE and moved.any():
+        free, valid = _bary_free(snap, l_tri, lco)
+        ext = moved & valid & (free.min(axis=1) < -1e-9)
+        rep['uv_corners_extrapolated'] = int(ext.sum())
+    if not ext.any():
+        free = None
+    else:
+        regions = _uv_regions(snap)
+        e_reg = regions[snap.tri_poly[np.where(l_tri >= 0, l_tri, 0)]]
+
+    for li, layer in enumerate(snap.uv_layers):
         uvl = me.uv_layers.get(layer['name'])
         if uvl is None:
             try:
@@ -1020,6 +1189,26 @@ def _apply_uvs(snap, me, nl, npo, NV, rep):
             rep['warnings'].append("could not create UV layer %r" % layer['name'])
             continue
         uv = _interp_loop(snap, l_tri, l_bary, layer['uv'])
+        if free is not None:
+            k = np.nonzero(ext)[0]
+            step = _interp_loop(snap, l_tri[k], free[k], layer['uv']) - uv[k]
+            need = np.linalg.norm(step, axis=1)
+            # the clamped UV sits on the island's own outline; measure from
+            # there how much room there is before another island's texels
+            room = 0.5 * _uv_clearance(snap, li, uv[k], e_reg[k])
+            # never extrapolate further than the source triangle's own UV size:
+            # a sliver at the island edge must not fling the corner away
+            tuv = layer['uv'][snap.tri_loops[l_tri[k]]].astype('f8')
+            span = np.linalg.norm(tuv - tuv.mean(axis=1)[:, None, :],
+                                  axis=2).max(axis=1)
+            allow = np.minimum(np.minimum(room, span), need)
+            uv[k] += step * np.where(need > _EPS,
+                                     allow / np.maximum(need, _EPS), 0.0)[:, None]
+            if k.size:
+                rep['uv_extrapolation_max'] = max(
+                    rep.get('uv_extrapolation_max', 0.0), float(allow.max()))
+                rep['uv_clearance_min'] = min(
+                    rep.get('uv_clearance_min', 1.0), float((2.0 * room).min()))
         uvl.data.foreach_set("uv", uv.astype('f4').ravel())
         rep['uv_layers'] += 1
         if layer['active']:
@@ -1035,7 +1224,64 @@ def _apply_uvs(snap, me, nl, npo, NV, rep):
     rep['uvs'] = rep['uv_layers'] > 0
 
 
+def _corner_triangles(me, npo, centers):
+    """Split every polygon into (centre, corner, next corner) triangles.
+
+    Returns (a, b, c, area, poly) per triangle; the triangles of one polygon
+    tile it exactly, so their areas are the weights of an area-weighted vote.
+    """
+    starts, totals, lverts = _poly_arrays(me)
+    nl = lverts.size
+    z = np.zeros((0, 3), 'f8')
+    if npo == 0 or nl == 0:
+        return z, z, z, np.zeros(0, 'f8'), np.zeros(0, 'i4')
+    V = _fget(me.vertices, "co", len(me.vertices) * 3, 'f8').reshape(-1, 3)
+    lp = np.repeat(np.arange(npo, dtype='i4'), totals)
+    idx = np.arange(nl, dtype='i8')
+    local = idx - np.repeat(starts.astype('i8'), totals)
+    nxt = starts[lp].astype('i8') + (local + 1) % np.maximum(totals[lp], 1)
+    a = centers[lp]
+    b = V[lverts]
+    c = V[lverts[nxt]]
+    area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    return a, b, c, area, lp
+
+
+def _bary_grid(k):
+    """k interior barycentric coordinates of a triangle (k = 1 or 3)."""
+    if k <= 1:
+        return np.full((1, 3), 1.0 / 3.0)
+    e = np.full((3, 3), 1.0 / 6.0)
+    np.fill_diagonal(e, 2.0 / 3.0)
+    return e
+
+
+def _sample_materials(snap, tri, sel, k, nslots):
+    """Vote weights of one sampling pass over the selected corner triangles."""
+    a, b, c, area, lp = tri[0], tri[1], tri[2], tri[3], tri[4]
+    a, b, c, area, lp = a[sel], b[sel], c[sel], area[sel], lp[sel]
+    bary = _bary_grid(k)
+    P = np.einsum('kb,nbj->nkj', bary,
+                  np.stack([a, b, c], axis=1)).reshape(-1, 3)
+    s_tri, _ = _nearest_tris(snap, P)
+    safe = np.where(s_tri >= 0, s_tri, 0)
+    mat = np.clip(snap.poly_material[snap.tri_poly[safe]], 0, nslots - 1)
+    mat = np.where(s_tri >= 0, mat, 0).astype('i8')
+    w = np.repeat(area / bary.shape[0], bary.shape[0])
+    poly = np.repeat(lp, bary.shape[0]).astype('i8')
+    return mat, w, poly, P.shape[0]
+
+
 def _apply_materials(snap, new_obj, me, npo, rep):
+    """Assign material slots by an area-weighted vote over each face.
+
+    Sampling only the face centre decides a whole quad from a single point, so
+    every output face straddling a material boundary is a coin flip: 0.63% of
+    the reference avatar's surface came out under the wrong material.  Each face
+    is instead split into corner triangles and voted on by area; faces whose
+    samples disagree (the ones actually on a boundary) are re-sampled three
+    times finer, which is where the accuracy is needed and nowhere else.
+    """
     me.materials.clear()
     remap = []
     for mat, name in snap.materials:
@@ -1043,27 +1289,399 @@ def _apply_materials(snap, new_obj, me, npo, rep):
         me.materials.append(m)
         remap.append(m)
     nslots = len(remap)
-    if nslots and npo:
-        centers = _poly_centers(me)
+    if not (nslots and npo):
+        return nslots
+    if snap.poly_material.size == 0 or nslots == 1:
+        me.polygons.foreach_set("material_index", np.zeros(npo, 'i4'))
+        return nslots
+
+    centers = _poly_centers(me)
+    if _MATERIAL_SAMPLES < 1:                  # face-centre only (pre-0.6.1)
         f_tri, _ = _nearest_tris(snap, centers)
         safe = np.where(f_tri >= 0, f_tri, 0)
-        src_poly = snap.tri_poly[safe]
-        mi = snap.poly_material[src_poly] if snap.poly_material.size else np.zeros(npo, 'i4')
-        mi = np.clip(mi, 0, nslots - 1).astype('i4')
-        me.polygons.foreach_set("material_index", mi)
+        mi = np.clip(snap.poly_material[snap.tri_poly[safe]], 0, nslots - 1)
+        me.polygons.foreach_set("material_index", mi.astype('i4'))
+        rep['material_samples'] = int(npo)
+        return nslots
+
+    tri = _corner_triangles(me, npo, centers)
+    ntri = tri[3].size
+    if ntri == 0:
+        return nslots
+
+    all_sel = np.arange(ntri)
+    mat, w, poly, ns = _sample_materials(snap, tri, all_sel, 1, nslots)
+    n_samples = ns
+
+    if _MATERIAL_SAMPLES > 1:
+        # a face whose coarse samples disagree straddles a boundary: only those
+        # are worth the finer pass
+        lo = np.full(npo, 1 << 30, 'i8')
+        hi = np.full(npo, -1, 'i8')
+        np.minimum.at(lo, poly, mat)
+        np.maximum.at(hi, poly, mat)
+        mixed = np.nonzero((hi >= 0) & (lo != hi))[0]
+        if mixed.size:
+            fine = np.zeros(npo, bool)
+            fine[mixed] = True
+            sel = np.nonzero(fine[tri[4]])[0]
+            keep = ~fine[poly]
+            mat2, w2, poly2, ns2 = _sample_materials(
+                snap, tri, sel, _MATERIAL_SAMPLES, nslots)
+            mat = np.concatenate([mat[keep], mat2])
+            w = np.concatenate([w[keep], w2])
+            poly = np.concatenate([poly[keep], poly2])
+            n_samples += ns2
+            rep['material_faces_refined'] = int(mixed.size)
+
+    acc = np.zeros((npo, nslots), 'f8')
+    np.add.at(acc, (poly, mat), w)
+    mi = np.argmax(acc, axis=1).astype('i4')
+    # degenerate faces (no area anywhere) have nothing to weigh: fall back to
+    # the material of one of their samples, i.e. the old face-centre behaviour
+    dead = acc.max(axis=1) <= 0.0
+    if dead.any():
+        first = np.zeros(npo, 'i8')
+        first[poly[::-1]] = np.arange(poly.size)[::-1]
+        mi[dead] = mat[first[dead]].astype('i4')
+    me.polygons.foreach_set("material_index", mi)
+    rep['material_samples'] = int(n_samples)
     return nslots
 
 
-def _transfer_edge_scalar(snap, me, EV, NV, src_vals, attr_name):
+def _csr_adj(EV, nv):
+    """CSR vertex->(neighbour, edge id) adjacency for an edge array."""
+    n = EV.shape[0]
+    a = np.concatenate([EV[:, 0], EV[:, 1]]).astype('i8')
+    b = np.concatenate([EV[:, 1], EV[:, 0]]).astype('i8')
+    e = np.concatenate([np.arange(n), np.arange(n)]).astype('i8')
+    o = np.argsort(a, kind='stable')
+    a, b, e = a[o], b[o], e[o]
+    off = np.searchsorted(a, np.arange(nv + 1))
+    return off, b, e
+
+
+def _source_arcs(edges):
+    """Split a marked-edge subgraph into simple arcs.
+
+    Returns a list of ``(vertex_path, edge_path)``.  Arcs run between vertices
+    where the subgraph branches or ends (degree != 2); anything left over is a
+    pure cycle, which is cut in half so that it, too, has two endpoints to route
+    between.  This is what makes the transfer chain-aware: the unit of matching
+    is a *path*, not a single edge.
+    """
+    adj = {}
+    for i, (a, b) in enumerate(edges.tolist()):
+        if a == b:
+            continue
+        adj.setdefault(a, []).append(i)
+        adj.setdefault(b, []).append(i)
+    used = [False] * edges.shape[0]
+
+    def walk(start, e0):
+        vpath = [start]
+        epath = []
+        cur, eid = start, e0
+        while True:
+            used[eid] = True
+            epath.append(eid)
+            a, b = int(edges[eid][0]), int(edges[eid][1])
+            cur = b if a == cur else a
+            vpath.append(cur)
+            if cur == start:
+                break
+            nb = adj.get(cur, ())
+            if len(nb) != 2:
+                break
+            nxt = [e for e in nb if e != eid]
+            if not nxt or used[nxt[0]]:
+                break
+            eid = nxt[0]
+        return vpath, epath
+
+    arcs = []
+    for v in sorted(k for k, l in adj.items() if len(l) != 2):
+        for e in adj[v]:
+            if not used[e]:
+                arcs.append(walk(v, e))
+    for e in range(edges.shape[0]):
+        if used[e]:
+            continue
+        vp, ep = walk(int(edges[e][0]), e)
+        if len(ep) < 2:
+            arcs.append((vp, ep))
+            continue
+        m = len(ep) // 2                      # cut the cycle into two arcs
+        arcs.append((vp[:m + 1], ep[:m]))
+        arcs.append((vp[m:], ep[m:]))
+    return arcs
+
+
+def _seg_dist(P, A, B):
+    """Distance from each point in P (n,3) to each segment A[i]-B[i] (m,3)."""
+    d = B - A
+    ll = np.einsum('ij,ij->i', d, d)
+    out = np.empty((P.shape[0], A.shape[0]), 'f8')
+    block = max(1, int(4_000_000 // max(A.shape[0], 1)))
+    for i in range(0, P.shape[0], block):
+        p = P[i:i + block]
+        ap = p[:, None, :] - A[None, :, :]
+        t = np.einsum('ijk,jk->ij', ap, d) / np.maximum(ll, _EPS)[None, :]
+        np.clip(t, 0.0, 1.0, out=t)
+        out[i:i + block] = np.linalg.norm(ap - t[:, :, None] * d[None, :, :], axis=2)
+    return out
+
+
+def _out_graph(EV, NV, cache):
+    """Adjacency / lengths / KD-trees of the output edge graph (built once)."""
+    if cache is not None and 'graph' in cache:
+        return cache['graph']
+    nv, ne = NV.shape[0], EV.shape[0]
+    off, nbr, nbre = _csr_adj(EV, nv)
+    elen = np.linalg.norm(NV[EV[:, 1]] - NV[EV[:, 0]], axis=1)
+    emid = (NV[EV[:, 0]] + NV[EV[:, 1]]) * 0.5
+    kd_mid = KDTree(ne)
+    for i, p in enumerate(emid.tolist()):
+        kd_mid.insert(p, i)
+    kd_mid.balance()
+    kd_vert = KDTree(nv)
+    for i, p in enumerate(NV.tolist()):
+        kd_vert.insert(p, i)
+    kd_vert.balance()
+    g = (off, nbr, nbre, elen, emid, kd_mid, kd_vert)
+    if cache is not None:
+        cache['graph'] = g
+    return g
+
+
+def _route_arc(cand, cdist, ne, off, nbr, nbre, elen, v_start, v_end, blocked):
+    """Cheapest corridor path between two output vertices (Dijkstra).
+
+    ``cand`` are the corridor's output edge ids, ``cdist`` their distance to the
+    source arc.  Cost is edge length inflated by how far the edge strays from
+    the arc, so the path hugs the source chain instead of cutting across it.
+    """
+    import heapq
+
+    keep = np.zeros(ne, bool)
+    keep[cand] = True
+    pen = np.zeros(ne, 'f8')
+    scale = max(cdist.max(), _EPS) if cdist.size else 1.0
+    pen[cand] = 1.0 + 3.0 * (cdist / scale)
+    cost = elen * pen + 1e-9
+
+    dist = {v_start: 0.0}
+    prev = {}
+    heap = [(0.0, int(v_start))]
+    seen = set()
+    while heap:
+        d, v = heapq.heappop(heap)
+        if v in seen:
+            continue
+        seen.add(v)
+        if v == v_end:
+            break
+        for k in range(int(off[v]), int(off[v + 1])):
+            e = int(nbre[k])
+            if not keep[e]:
+                continue
+            u = int(nbr[k])
+            if u in blocked and u != v_end:
+                continue
+            nd = d + float(cost[e])
+            if nd < dist.get(u, np.inf):
+                dist[u] = nd
+                prev[u] = (v, e)
+                heapq.heappush(heap, (nd, u))
+    if v_end not in prev and v_end != v_start:
+        return None
+    path = []
+    v = int(v_end)
+    guard = 0
+    while v != v_start:
+        pv, pe = prev[v]
+        path.append(pe)
+        v = pv
+        guard += 1
+        if guard > 100000:
+            return None
+    return path[::-1]
+
+
+def _route_edge_scalar(snap, EV, NV, src_idx, src_vals, cache=None):
+    """Chain-aware transfer: every source path becomes one output path.
+
+    The nearest-edge match this replaces assigns per *edge*: one source crease
+    edge is picked up by every output edge that happens to be nearest to it, so
+    a 6-edge crease came out as an 8-edge thicket with degree-4 junctions and
+    2.4x the length.  Here the source's marked subgraph is split into arcs and
+    each arc is routed through the output edge graph as a single path, so the
+    result is a chain of comparable length with the source's own topology.
+
+    Returns a per-output-edge value array, or None to fall back.
+    """
+    SV = snap.verts
+    se = snap.edges[src_idx]
+    ne = EV.shape[0]
+    off, nbr, nbre, elen, emid, kd_mid, kd_vert = _out_graph(EV, NV, cache)
+
+    def local_len(v):
+        lo, hi = int(off[v]), int(off[v + 1])
+        return float(elen[nbre[lo:hi]].mean()) if hi > lo else 0.0
+
+    out = np.zeros(ne, 'f4')
+    blocked = set()
+    n_arcs = n_failed = 0
+    for vpath, epath in _source_arcs(se):
+        if not epath:
+            continue
+        n_arcs += 1
+        A = SV[np.asarray(vpath, 'i8')]
+        seg_a, seg_b = A[:-1], A[1:]
+        slen = np.linalg.norm(seg_b - seg_a, axis=1)
+        arc_len = float(slen.sum())
+        vals = src_vals[src_idx[np.asarray(epath, 'i8')]]
+
+        _c, vs, _d = kd_vert.find(A[0].tolist())
+        _c, ve, _d = kd_vert.find(A[-1].tolist())
+        if vs is None or ve is None:
+            n_failed += 1
+            continue
+        lloc = max(local_len(vs), local_len(ve), _EPS)
+        R = 0.75 * (lloc + float(slen.mean()))
+
+        # corridor: output edges whose midpoint stays within R of the arc.
+        # Widened in two steps when the narrow corridor has no connected route
+        # (a chain that runs diagonally across the new quads needs elbow room);
+        # the length guard below is what actually keeps a path honest.
+        seen = set()
+        probe = np.concatenate([A, (seg_a + seg_b) * 0.5], axis=0)
+        rng = kd_mid.find_range
+        for p in probe.tolist():
+            for _co, i, _d in rng(p, _CORRIDOR_STEPS[-1] * R + lloc):
+                seen.add(int(i))
+        if not seen:
+            n_failed += 1
+            continue
+        all_cand = np.fromiter(sorted(seen), 'i8', len(seen))
+        all_dist = _seg_dist(emid[all_cand], seg_a, seg_b).min(axis=1)
+        smid = (seg_a + seg_b) * 0.5
+
+        def _single():
+            """One output edge for a chain the new mesh cannot resolve."""
+            near = all_dist <= R
+            if not near.any():
+                return False
+            c, d = all_cand[near], all_dist[near]
+            dirn = NV[EV[c, 1]] - NV[EV[c, 0]]
+            dirn /= np.maximum(np.linalg.norm(dirn, axis=1), _EPS)[:, None]
+            av = A[-1] - A[0]
+            av = av / max(float(np.linalg.norm(av)), _EPS)
+            align = np.abs(dirn @ av)
+            ok = align >= 0.5
+            if not ok.any():
+                return False
+            i = int(c[ok][np.argmin(d[ok])])
+            j = int(np.argmin(np.linalg.norm(smid - emid[i], axis=1)))
+            out[i] = max(out[i], vals[j])
+            return True
+
+        if vs == ve:
+            # the arc is shorter than one output edge: keep the single best
+            # candidate rather than every edge that brushes past it
+            if not _single():
+                n_failed += 1
+            continue
+
+        limit = max(2.5 * arc_len, arc_len + 2.0 * lloc)
+        path = None
+        for mult in _CORRIDOR_STEPS:
+            near = all_dist <= mult * R
+            if not near.any():
+                continue
+            got = _route_arc(all_cand[near], all_dist[near], ne, off, nbr,
+                             nbre, elen, vs, ve, blocked)
+            if got is not None and float(elen[got].sum()) <= limit:
+                path = got
+                break
+        if path is None:
+            # A source chain finer than the new mesh's own edges has no honest
+            # path to become; one edge keeps the feature without inflating it.
+            if not (arc_len <= 1.5 * lloc and _single()):
+                n_failed += 1
+            continue
+        for e in path:
+            j = int(np.argmin(np.linalg.norm(smid - emid[e], axis=1)))
+            out[e] = max(out[e], vals[j])
+        for v in (int(EV[e][0]) for e in path):
+            blocked.add(v)
+        for v in (int(EV[e][1]) for e in path):
+            blocked.add(v)
+        blocked.discard(int(vs))
+        blocked.discard(int(ve))
+
+    if n_arcs == 0 or n_failed > 0.5 * n_arcs:
+        return None                    # routing is not working here; fall back
+    return out
+
+
+def _unrepresented(snap, src_idx, EV, NV, out):
+    """Source marked edges with no transferred edge anywhere near them."""
+    hit = np.nonzero(out > 0.0)[0]
+    if hit.size == 0:
+        return int(src_idx.size)
+    mid = (NV[EV[hit, 0]] + NV[EV[hit, 1]]) * 0.5
+    kd = KDTree(hit.size)
+    for i, p in enumerate(mid.tolist()):
+        kd.insert(p, i)
+    kd.balance()
+    se = snap.edges[src_idx]
+    sa, sb = snap.verts[se[:, 0]], snap.verts[se[:, 1]]
+    smid = (sa + sb) * 0.5
+    slen = np.linalg.norm(sb - sa, axis=1)
+    nlen = np.linalg.norm(NV[EV[hit, 1]] - NV[EV[hit, 0]], axis=1)
+    n_bad = 0
+    find = kd.find
+    for i, p in enumerate(smid.tolist()):
+        _co, j, d = find(p)
+        if j is None or d > 0.75 * (slen[i] + nlen[j]):
+            n_bad += 1
+    return n_bad
+
+
+def _transfer_edge_scalar(snap, me, EV, NV, src_vals, attr_name, cache=None):
+    """Transfer a per-edge float (crease / bevel weight) onto the new mesh.
+
+    Chain-aware when the marked subgraph is small enough to route arc by arc
+    (``_route_edge_scalar``); otherwise the legacy nearest-edge match below.
+    """
+    src_idx = np.nonzero(src_vals > 0.0)[0]
+    if src_idx.size == 0 or EV.shape[0] == 0:
+        return 0, 0
+    out = None
+    if src_idx.size <= _MAX_CHAIN_EDGES:
+        try:
+            out = _route_edge_scalar(snap, EV, NV, src_idx, src_vals, cache)
+        except Exception:
+            out = None
+    if out is not None:
+        n_ok = int((out > 0.0).sum())
+        if n_ok:
+            at = _ensure_float_attr(me, attr_name, 'EDGE', EV.shape[0])
+            if at is None:
+                return 0, int(src_idx.size)
+            at.data.foreach_set("value", out)
+        return n_ok, _unrepresented(snap, src_idx, EV, NV, out)
+    return _nearest_edge_scalar(snap, me, EV, NV, src_vals, attr_name, src_idx)
+
+
+def _nearest_edge_scalar(snap, me, EV, NV, src_vals, attr_name, src_idx):
     """Conservative nearest-edge transfer of a per-edge float.
 
     Only source edges with a non-zero value are candidates; a new edge picks one
     up when its midpoint is close to the source edge midpoint (relative to the
     two edge lengths) and the two edges point roughly the same way.
     """
-    src_idx = np.nonzero(src_vals > 0.0)[0]
-    if src_idx.size == 0 or EV.shape[0] == 0:
-        return 0, 0
     SV = snap.verts
     se = snap.edges[src_idx]
     sa, sb = SV[se[:, 0]], SV[se[:, 1]]

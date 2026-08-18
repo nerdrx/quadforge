@@ -187,6 +187,47 @@ class _UVRef:
                 P.tolist(), [tuple(x) for x in t.tolist()], all_triangles=True)
         return self._bvh
 
+    def trace_affine(self, UV, P, radius=1e-4):
+        """Like ``trace``, but the source triangle's map is *not* clipped.
+
+        A UV outside every island still means something: it is the source
+        parameterisation continued past the island's edge, which is exactly what
+        bounded extrapolation writes and what a tiling or coordinate-driven
+        texture reads.  Clipping (as ``trace`` does) measures the same UV as if
+        the sampler snapped it back to the island outline.
+        """
+        bvh = self.uvbvh()
+        rng, near = bvh.find_nearest_range, bvh.find_nearest
+        own, tri = [], []
+        for i, uv in enumerate(UV.tolist()):
+            q = (uv[0], uv[1], 0.0)
+            cs = rng(q, radius)
+            if not cs:
+                r = near(q)
+                if r is None or r[2] is None:
+                    continue
+                cs = [r]
+            for c in cs:
+                own.append(i)
+                tri.append(c[2])
+        own = np.asarray(own, 'i8')
+        tri = np.asarray(tri, 'i8')
+        if own.size == 0:
+            return own, np.zeros(0)
+        L = self.tri_loops[tri]
+        a, b, c = self.uv[L[:, 0]], self.uv[L[:, 1]], self.uv[L[:, 2]]
+        v0, v1, v2 = b - a, c - a, UV[own] - a
+        d = lambda x, y: np.einsum('ij,ij->i', x, y)      # noqa: E731
+        d00, d01, d11 = d(v0, v0), d(v0, v1), d(v1, v1)
+        d20, d21 = d(v2, v0), d(v2, v1)
+        den = d00 * d11 - d01 * d01
+        den = np.where(np.abs(den) < 1e-18, 1.0, den)
+        vv = (d11 * d20 - d01 * d21) / den
+        ww = (d00 * d21 - d01 * d20) / den
+        B = np.stack([1.0 - vv - ww, vv, ww], 1)
+        pos = np.einsum('ijk,ij->ik', self.V[self.tris[tri]], B)
+        return own, np.linalg.norm(pos - P[own], axis=1)
+
     def trace(self, UV, P, radius=1e-4):
         """All UV-coincident candidates: (own, err, island) flat arrays."""
         bvh = self.uvbvh()
@@ -346,6 +387,215 @@ def two_island_sphere(ctx, segments=48, rings=24, name="TwoIsland"):
     for kb in me.shape_keys.key_blocks:
         kb.value = 0.0
     return obj
+
+
+def crease_rim_cube(ctx, subdiv=3, name="CreaseRim"):
+    """Cube whose top rim is creased 1.0 and bottom rim bevel-weighted 1.0.
+
+    Both are single closed loops of exactly known length (8.0, the cube's
+    perimeter at 2 units a side), which is what makes a per-edge nearest match
+    obvious: one source ring comes back as a bush of stubs and junctions rather
+    than one ring of comparable length.
+    """
+    obj = ctx.cube(size=2.0, subdiv=subdiv, name=name)
+    me = obj.data
+    ne = len(me.edges)
+    EV = _fget(me.edges, "vertices", ne * 2, 'i4').reshape(-1, 2)
+    V = _verts(me)
+    cr = np.zeros(ne, 'f4')
+    bw = np.zeros(ne, 'f4')
+    rim = np.max(np.abs(V[:, :2]), axis=1) > 1.0 - 1e-6
+    for i, (a, b) in enumerate(EV.tolist()):
+        if not (rim[a] and rim[b]):
+            continue
+        if abs(V[a, 2] - 1.0) < 1e-6 and abs(V[b, 2] - 1.0) < 1e-6:
+            cr[i] = 1.0
+        elif abs(V[a, 2] + 1.0) < 1e-6 and abs(V[b, 2] + 1.0) < 1e-6:
+            bw[i] = 1.0
+    for attr, vals in (("crease_edge", cr), ("bevel_weight_edge", bw)):
+        at = me.attributes.get(attr) or me.attributes.new(attr, 'FLOAT', 'EDGE')
+        at.data.foreach_set("value", vals)
+    return obj
+
+
+def material_band_sphere(ctx, segments=64, rings=32, name="MatBand"):
+    """Sphere carrying three materials split along a wandering band.
+
+    The boundary wiggles at (and below) the size of an output face, which is
+    where a single sample at the face centre stops being a good guess for the
+    material that owns most of that face — real assets get this from material
+    borders that follow the source mesh's own zig-zagging edges.
+    """
+    obj = ctx.uv_sphere(segments=segments, rings=rings, name=name)
+    me = obj.data
+    for nm in ("qf_band_a", "qf_band_b", "qf_band_c"):
+        me.materials.append(bpy.data.materials.new(nm))
+    for p in me.polygons:
+        c = p.center
+        th = math.atan2(c.y, c.x)
+        w = (0.45 * math.sin(3.0 * th) + 0.15 * math.sin(7.0 * th)
+             + 0.10 * math.sin(29.0 * th) + 0.06 * math.sin(53.0 * th))
+        p.material_index = 1 if c.z > w else (2 if c.z < w - 0.8 else 0)
+    if not me.uv_layers:
+        me.uv_layers.new(name="UVMap")
+    return obj
+
+
+def edge_chain_stats(me, attr):
+    """Topology of the subgraph an edge scalar marks: the shape of the chain.
+
+    A transferred crease that double-assigns shows up here as many components
+    with degree-3+ junctions and loose ends; one clean ring is comps=1,
+    ends=0, junctions=0.
+    """
+    ne = len(me.edges)
+    at = me.attributes.get(attr)
+    out = {'n': 0, 'sum': 0.0, 'len': 0.0, 'comps': 0, 'ends': 0,
+           'junctions': 0, 'maxdeg': 0}
+    if at is None or ne == 0:
+        return out
+    v = np.empty(ne, 'f4')
+    at.data.foreach_get("value", v)
+    idx = np.nonzero(v > 0.0)[0]
+    if idx.size == 0:
+        return out
+    EV = _fget(me.edges, "vertices", ne * 2, 'i4').reshape(-1, 2)
+    V = _verts(me)
+    e = EV[idx]
+    vs, cnt = np.unique(e.ravel(), return_counts=True)
+    parent = {int(x): int(x) for x in vs}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for a, b in e.tolist():
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    out.update({
+        'n': int(idx.size), 'sum': float(v[idx].sum()),
+        'len': float(np.linalg.norm(V[e[:, 1]] - V[e[:, 0]], axis=1).sum()),
+        'comps': len({find(int(x)) for x in vs}),
+        'ends': int((cnt == 1).sum()), 'junctions': int((cnt > 2).sum()),
+        'maxdeg': int(cnt.max()),
+    })
+    return out
+
+
+def material_mismatch(src_me, out_me, seed=11, per_tri=4):
+    """How much of the output surface carries the wrong material.
+
+    Deterministic stratified samples over every output face are mapped to the
+    nearest point of the source and compared with the material the face was
+    assigned; area-weighted, so it reads as "how much of the model is wrong",
+    not "how many faces".
+
+    Returns (wrong_pct, majority_pct).  The second number is the part that was
+    actually decidable: area sitting on a face whose assigned material is not
+    even the one that owns most of that face.  A face split by a material
+    boundary always costs the minority side no matter what is assigned, so
+    ``wrong_pct`` can never reach zero, while ``majority_pct`` can.
+    """
+    sV = _verts(src_me)
+    s_st, s_to, s_lv = _polys(src_me)
+    _tl, s_tris, s_tp = _fan(s_st, s_to, s_lv)
+    s_mat = _fget(src_me.polygons, "material_index", len(src_me.polygons), 'i4')
+    bvh = _bvh(sV, s_tris)
+    if bvh is None:
+        return None
+
+    oV = _verts(out_me)
+    o_st, o_to, o_lv = _polys(out_me)
+    o_mat = _fget(out_me.polygons, "material_index", len(out_me.polygons), 'i4')
+    _otl, o_tris, o_tp = _fan(o_st, o_to, o_lv)
+    A = oV[o_tris]
+    area = 0.5 * np.linalg.norm(np.cross(A[:, 1] - A[:, 0], A[:, 2] - A[:, 0]),
+                                axis=1)
+    rng = np.random.default_rng(seed)
+    r1 = np.sqrt(rng.random((A.shape[0], per_tri)))
+    r2 = rng.random((A.shape[0], per_tri))
+    P = (A[:, 0][:, None, :] * (1.0 - r1)[:, :, None]
+         + A[:, 1][:, None, :] * (r1 * (1.0 - r2))[:, :, None]
+         + A[:, 2][:, None, :] * (r1 * r2)[:, :, None]).reshape(-1, 3)
+    w = np.repeat(area / per_tri, per_tri)
+    face = np.repeat(o_tp, per_tri)
+    fn = bvh.find_nearest
+    hit = np.full(P.shape[0], -1, 'i8')
+    for i, p in enumerate(P.tolist()):
+        r = fn(p)
+        if r is not None and r[2] is not None:
+            hit[i] = r[2]
+    want = s_mat[s_tp[np.where(hit >= 0, hit, 0)]]
+    ok = hit >= 0
+    bad = (want != o_mat[face]) & ok
+    total = max(float(w.sum()), 1e-12)
+    npo = len(out_me.polygons)
+    nslots = int(max(want.max(initial=0), o_mat.max(initial=0))) + 1
+    acc = np.zeros((npo, nslots), 'f8')
+    np.add.at(acc, (face[ok].astype('i8'), want[ok].astype('i8')), w[ok])
+    major = np.argmax(acc, axis=1)
+    seen = acc.max(axis=1) > 0.0
+    off = seen & (major != o_mat[:npo])
+    return (100.0 * float(w[bad].sum()) / total,
+            100.0 * float(w[off[face]].sum()) / total)
+
+
+def uv_affine_backprojection(src_me, out_me):
+    """Back-projection error measured against the *unclipped* source map."""
+    ref = _UVRef(src_me)
+    nl = len(out_me.loops)
+    uvl = out_me.uv_layers.get(ref.name) or out_me.uv_layers.active
+    if uvl is None or nl == 0:
+        return {'n': 0, 'mean': 0.0, 'p99': 0.0, 'max': 0.0}
+    a = np.empty(nl * 2, 'f4')
+    uvl.data.foreach_get("uv", a)
+    OUV = a.reshape(-1, 2).astype('f8')
+    V = _verts(out_me)
+    _st, _to, lv = _polys(out_me)
+    own, err = ref.trace_affine(OUV, V[lv])
+    best = np.full(nl, np.inf)
+    if own.size:
+        np.minimum.at(best, own, err)
+    return _stat(np.where(np.isfinite(best), best, np.nan), _diag(ref.V))
+
+
+def uv_island_incursion(src_me, out_me, cap=0.05):
+    """How close transferred UVs get to an island they do not belong to.
+
+    Returns (n_outside, worst_uv_shift, closest_foreign_island).  Bounded
+    extrapolation is only honest if the corners it pushes past an island's
+    outline stay clear of every other island's texels.
+    """
+    ref = _UVRef(src_me)
+    nl = len(out_me.loops)
+    uvl = out_me.uv_layers.get(ref.name) or out_me.uv_layers.active
+    if uvl is None or nl == 0:
+        return 0, 0.0, cap
+    a = np.empty(nl * 2, 'f4')
+    uvl.data.foreach_get("uv", a)
+    OUV = a.reshape(-1, 2).astype('f8')
+    isl_tri = ref.island[ref.tri_poly]
+    bvh = ref.uvbvh()
+    worst_out = 0.0
+    closest = cap
+    n_out = 0
+    for i, uvp in enumerate(OUV.tolist()):
+        q = (uvp[0], uvp[1], 0.0)
+        r = bvh.find_nearest(q)
+        if r is None or r[2] is None or r[3] is None or r[3] <= 1e-9:
+            continue
+        n_out += 1
+        worst_out = max(worst_out, float(r[3]))
+        own = isl_tri[int(r[2])]
+        for hit in bvh.find_nearest_range(q, cap):
+            if hit is None or hit[2] is None or hit[3] is None:
+                continue
+            if isl_tri[int(hit[2])] != own:
+                closest = min(closest, float(hit[3]))
+    return n_out, worst_out, closest
 
 
 GAP = 0.02
@@ -607,6 +857,81 @@ def run(ctx):
         c.note("L1=%.5f src=%s out=%s"
                % (l1, np.round(a, 4).tolist(), np.round(b, 4).tolist()))
 
+    # ------------------------------------------- bounded UV extrapolation
+    with r.case("uv_extrapolation_is_bounded") as c:
+        src, out = st.get('src'), st.get('out')
+        c.require(out is not None, "no result mesh")
+        transfer = ctx.imp("quadforge.core.transfer")
+        c.require(hasattr(transfer, "_uv_clearance"),
+                  "transfer._uv_clearance missing (bounded extrapolation gone?)")
+        snap = transfer.capture(src)
+        s = out.quadforge
+        old = transfer._UV_EXTRAPOLATE
+        try:
+            transfer._UV_EXTRAPOLATE = False
+            transfer.apply(snap, out, s)
+            flat_aff = uv_affine_backprojection(src.data, out.data)
+            flat_clip = uv_quality(src.data, out.data)
+            transfer._UV_EXTRAPOLATE = True
+            rep = transfer.apply(snap, out, s)
+            ext_aff = uv_affine_backprojection(src.data, out.data)
+            ext_clip = uv_quality(src.data, out.data)
+        finally:
+            transfer._UV_EXTRAPOLATE = old
+        st['ext_rep'] = rep
+        n_out, worst_shift, closest = uv_island_incursion(src.data, out.data)
+        c.require(rep.get('uv_corners_extrapolated', 0) > 0,
+                  "no corner extrapolated on a fixture with two islands "
+                  "0.08 UV apart")
+        # the whole point: a corner may leave its island, never reach another
+        c.require(closest > 0.0,
+                  "an extrapolated UV landed on another island (closest "
+                  "approach %.6f UV)" % closest)
+        c.require(worst_shift <= 0.5 * closest + 1e-9,
+                  "worst UV excursion %.6f is more than half the %.6f clearance "
+                  "to the nearest other island" % (worst_shift, closest))
+        c.require(worst_shift <= 0.5 * transfer._UV_CLEARANCE_CAP + 1e-9,
+                  "UV excursion %.6f exceeds the hard cap" % worst_shift)
+        c.require(ext_clip['bleed_faces'] <= flat_clip['bleed_faces'],
+                  "extrapolation created %d new two-island faces"
+                  % (ext_clip['bleed_faces'] - flat_clip['bleed_faces']))
+        # measured gain: the UV now continues the source map past the island
+        c.require(ext_aff['p99'] <= 0.5 * flat_aff['p99'],
+                  "affine back-projection p99 %.3e is no better than the "
+                  "clamped %.3e" % (ext_aff['p99'], flat_aff['p99']))
+        c.note("ext=%d worst=%.6f clearance>=%.6f; affine p99 %.3e->%.3e "
+               "max %.3e->%.3e; clamped p99 %.3e->%.3e"
+               % (rep.get('uv_corners_extrapolated', 0), worst_shift, closest,
+                  flat_aff['p99'], ext_aff['p99'], flat_aff['max'],
+                  ext_aff['max'], flat_clip['p99'], ext_clip['p99']))
+
+    with r.case("uv_extrapolation_off_without_clearance") as c:
+        # islands packed with no room (the reference avatar's layout) must come
+        # out exactly as before: no room measured, no excursion taken
+        src, out = st.get('src'), st.get('out')
+        c.require(out is not None, "no result mesh")
+        transfer = ctx.imp("quadforge.core.transfer")
+        snap = transfer.capture(src)
+        real = transfer._uv_clearance
+        try:
+            transfer._uv_clearance = lambda sn, li, pts, own: np.zeros(len(pts))
+            rep = transfer.apply(snap, out, st['out'].quadforge)
+            packed = uv_quality(src.data, out.data)
+        finally:
+            transfer._uv_clearance = real
+        c.require(rep.get('uv_extrapolation_max', 0.0) <= 1e-9,
+                  "a layout with zero clearance still moved a corner by %.3e UV"
+                  % rep.get('uv_extrapolation_max', 0.0))
+        n_out, worst_shift, _closest = uv_island_incursion(src.data, out.data)
+        # UVs are stored as float32: a corner sitting exactly on an island's
+        # outline quantises to a few ulps outside it, which is not an excursion
+        c.require(worst_shift <= 1e-6,
+                  "corners left the layout (%.3e UV) with no clearance to spend"
+                  % worst_shift)
+        c.note("no-clearance: bleed=%d worst_shift=%.3e"
+               % (packed['bleed_faces'], worst_shift))
+        transfer.apply(snap, out, st['out'].quadforge)
+
     # ------------------------------------------------ crevice / rig fixture
     with r.case("crevice_remesh_ok") as c:
         ctx.fresh_scene()
@@ -688,5 +1013,124 @@ def run(ctx):
         c.note("islands=%d bleed=%d/%d (%.2f%%) mean=%.6f"
                % (q['islands'], q['bleed_faces'], q['faces'], q['bleed_pct'],
                   q['mean']))
+
+    # ------------------------------------------- crease / bevel chains
+    with r.case("crease_chains_stay_chains") as c:
+        transfer = ctx.imp("quadforge.core.transfer")
+        rows = []
+        for subdiv, target in ((3, 1500), (3, 400), (4, 300)):
+            ctx.fresh_scene()
+            src = crease_rim_cube(ctx, subdiv)
+            res = _remesh(ctx, src, target)
+            c.require(res.get("ok") is True,
+                      "subdiv=%d target=%d failed: %r"
+                      % (subdiv, target, res.get("error")))
+            out = res.get("object")
+            c.require(ctx.is_mesh_valid(out), "no result mesh")
+            for attr in ("crease_edge", "bevel_weight_edge"):
+                a = edge_chain_stats(src.data, attr)
+                b = edge_chain_stats(out.data, attr)
+                tag = "%s subdiv=%d target=%d" % (attr, subdiv, target)
+                c.require(a['comps'] == 1 and a['ends'] == 0,
+                          "%s: the fixture's own ring is not a ring" % tag)
+                c.require(b['n'] > 0, "%s: nothing transferred" % tag)
+                c.require(b['comps'] == 1,
+                          "%s: one source ring came out as %d pieces"
+                          % (tag, b['comps']))
+                c.require(b['junctions'] == 0,
+                          "%s: %d vertices carry 3+ marked edges (the source "
+                          "ring has none) — edges were double-assigned"
+                          % (tag, b['junctions']))
+                c.require(b['ends'] == 0,
+                          "%s: a closed ring came out with %d loose ends"
+                          % (tag, b['ends']))
+                ratio = b['len'] / max(a['len'], 1e-12)
+                c.require(0.8 <= ratio <= 1.3,
+                          "%s: transferred ring is %.2fx the source's length"
+                          % (tag, ratio))
+                c.require(abs(b['sum'] - b['n']) < 1e-3,
+                          "%s: weights drifted (sum %.3f over %d edges, all "
+                          "source values are 1.0)" % (tag, b['sum'], b['n']))
+                rows.append("%s %d/%d len=%.2fx" % (attr[:6], b['n'], a['n'], ratio))
+            st['crease_src'], st['crease_out'] = src, out
+        c.note("; ".join(rows))
+
+    with r.case("crease_chains_beat_nearest_edge") as c:
+        src, out = st.get('crease_src'), st.get('crease_out')
+        c.require(out is not None, "no crease fixture")
+        transfer = ctx.imp("quadforge.core.transfer")
+        c.require(hasattr(transfer, "_route_edge_scalar"),
+                  "transfer._route_edge_scalar missing (chain routing gone?)")
+        snap = transfer.capture(src)
+        s = out.quadforge
+        real = transfer._route_edge_scalar
+        try:
+            transfer._route_edge_scalar = lambda *a, **k: None   # legacy match
+            transfer.apply(snap, out, s)
+            legacy = edge_chain_stats(out.data, "crease_edge")
+        finally:
+            transfer._route_edge_scalar = real
+        transfer.apply(snap, out, s)
+        chain = edge_chain_stats(out.data, "crease_edge")
+        c.require(chain['comps'] <= legacy['comps'],
+                  "chain routing (%d pieces) is not tidier than the nearest-edge "
+                  "match (%d pieces)" % (chain['comps'], legacy['comps']))
+        c.require(chain['junctions'] <= legacy['junctions'],
+                  "chain routing left %d junctions, nearest-edge %d"
+                  % (chain['junctions'], legacy['junctions']))
+        c.require(legacy['comps'] > 1 or legacy['junctions'] > 0,
+                  "the nearest-edge match came out clean on this fixture — the "
+                  "comparison proves nothing, pick a harder one")
+        c.note("nearest-edge: %d edges, %d pieces, %d junctions -> chain: "
+               "%d edges, %d pieces, %d junctions"
+               % (legacy['n'], legacy['comps'], legacy['junctions'],
+                  chain['n'], chain['comps'], chain['junctions']))
+
+    # ------------------------------------------- material point sampling
+    with r.case("materials_point_sampling") as c:
+        ctx.fresh_scene()
+        transfer = ctx.imp("quadforge.core.transfer")
+        src = material_band_sphere(ctx)
+        res = _remesh(ctx, src, 1200)
+        c.require(res.get("ok") is True, "run failed: %r" % (res.get("error"),))
+        out = res.get("object")
+        c.require(ctx.is_mesh_valid(out), "no result mesh")
+        _visible(src)
+        _visible(out)
+        snap = transfer.capture(src)
+        s = out.quadforge
+        old = transfer._MATERIAL_SAMPLES
+        try:
+            transfer._MATERIAL_SAMPLES = 0       # face centre only (pre-0.6.1)
+            transfer.apply(snap, out, s)
+            c_wrong, c_major = material_mismatch(src.data, out.data)
+            transfer._MATERIAL_SAMPLES = old
+            rep = transfer.apply(snap, out, s)
+            v_wrong, v_major = material_mismatch(src.data, out.data)
+        finally:
+            transfer._MATERIAL_SAMPLES = old
+        # a face split by a boundary always costs its minority side, so the
+        # decidable part is "is the face under the material that owns most of
+        # it": avatar 46031 -> 35395 faces, 0.627% -> 0.409% of the surface
+        # wrong, and 0.501% -> 0.286% of it away from any boundary at all
+        c.require(v_major <= 0.75 * c_major,
+                  "area-weighted voting puts %.3f%% of the surface under a "
+                  "material that does not own its face; face-centre sampling "
+                  "managed %.3f%%" % (v_major, c_major))
+        c.require(v_wrong <= c_wrong,
+                  "area-weighted voting (%.3f%% of the surface wrong) is worse "
+                  "than face-centre sampling (%.3f%%)" % (v_wrong, c_wrong))
+        c.require(v_major <= 3.0,
+                  "%.3f%% of the surface is not under its face's own majority "
+                  "material" % v_major)
+        c.require(rep.get('material_samples', 0) > len(out.data.polygons),
+                  "the material vote used %r samples for %d faces — that is "
+                  "still one point per face"
+                  % (rep.get('material_samples'), len(out.data.polygons)))
+        c.note("centre wrong=%.3f%% major=%.3f%% -> vote wrong=%.3f%% "
+               "major=%.3f%% (%d samples, %d faces refined)"
+               % (c_wrong, c_major, v_wrong, v_major,
+                  rep.get('material_samples', 0),
+                  rep.get('material_faces_refined', 0)))
 
     return r.list()
