@@ -794,6 +794,22 @@ def preprocess(context, work_obj, s, report: dict) -> None:
         report.setdefault("warnings", []).append(f"hard edge detection failed: {exc}")
         report["hard_edges"] = 0
 
+    # Flag-based flow features are a Native-backend capability: measured
+    # (identical output hashes) Blender's QuadriFlow derives features from
+    # dihedral angle only and ignores sharp FLAGS on flat geometry.
+    if getattr(s, "backend", "QUADRIFLOW") == "QUADRIFLOW":
+        flag_features = [name for flag, name in (
+            (getattr(s, "use_guides", False), "guides"),
+            (getattr(s, "use_materials", False), "material boundaries"),
+            (getattr(s, "use_uv_seams", False), "UV island boundaries"),
+        ) if flag]
+        if flag_features:
+            report.setdefault("warnings", []).append(
+                "QuadriFlow ignores flag-marked features on flat geometry - "
+                + ", ".join(flag_features)
+                + " will only influence flow where real dihedral angles "
+                  "coincide; use the Native backend for these")
+
     if getattr(s, "use_uv_seams", False):
         try:
             report["uv_seam_edges"] = analysis.uv_island_boundaries_to_sharp(work_obj)

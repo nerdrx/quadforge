@@ -175,6 +175,11 @@ project's subtlest regression).
   epsilon (~real-world VRChat scale); refuses face targets below ~24.
 - U5. Boundary-constrained solves flatten features within ~2 edge lengths of
   the boundary (the "missing inner toes").
+- U7. `use_preserve_sharp` derives features from geometric dihedral angle
+  only: sharp *flags* on flat geometry are ignored entirely (verified by
+  identical output hashes) — so any flag-based flow-control scheme
+  (guides, material boundaries, UV seams marked as sharp) is silently
+  inert on this solver wherever the surface is flat.
 - U6. `bpy.data.libraries.load` mutates the requested-names list in place;
   `Object.copy()` carries a stale bound box until a depsgraph update; objects
   in excluded collections do not evaluate their armature modifiers (a trap
