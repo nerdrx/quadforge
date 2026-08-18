@@ -37,6 +37,8 @@ preserved as authored; the body is solved with curvature-following quads:
 - **Material boundaries** become preserved edge loops
 - **Guide curves** — draw Bezier/Grease-Pencil strokes; QuadForge projects them onto the
   surface and aligns edge flow along them
+- **Preview Flow** — see the edge flow and the quad sizing before you commit to a solve:
+  the orientation field alone, drawn as flow strokes, in a fraction of a remesh
 - **Opening Rings** (experimental, Native, opt-in) — concentric loops around eye
   sockets, mouth rims and ear holes instead of a grid clipped by the hole, with a
   local density boost so the rings can actually close at normal game budgets
@@ -48,7 +50,8 @@ preserved as authored; the body is solved with curvature-following quads:
 - **Exact mode**: bisect → remesh half → mirror-weld = mathematically perfect symmetry
 
 **Data preservation (the good stuff)**
-- UVs (seam-aware), materials + face assignments, vertex groups (weights),
+- UVs (island-constrained — no output face is ever textured from two UV islands),
+  materials + face assignments, vertex groups (weights),
   **shape keys**, creases, bevel weights — all re-projected onto the new topology.
   Remesh a rigged, shape-keyed character and keep working.
 

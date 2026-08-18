@@ -117,7 +117,8 @@ def capture(obj) -> Snapshot        # UVs, materials+poly assignments, vgroups, 
                                     # creases, bevel weights, custom normals flag; original mesh copy
 def apply(snapshot, new_obj, s) -> dict   # surface-nearest mapping (build BVH on original mesh);
     # shape keys: transfer basis-relative deltas via barycentric surface mapping.
-    # returns {'uvs': bool, 'weights': int, 'shape_keys': int, 'materials': int, ...}
+    # returns {'uvs': bool, 'weights': int, 'shape_keys': int, 'materials': int,
+    #          'uv_seam_faces': int, 'uv_seam_faces_fixed': int, 'uv_seam_corners_fixed': int, ...}
 ```
 
 ## Report contract (core/report.py)
@@ -131,7 +132,9 @@ def mesh_report(obj) -> dict   # faces, quads, tris, ngons, quad_pct, poles_3, p
 
 `quadforge.remesh`, `quadforge.paint_density`, `quadforge.clear_density`,
 `quadforge.remesh_batch`, `quadforge.generate_lods`, `quadforge.quality_report`,
-`quadforge.toggle_original`, `quadforge.guides_new`, `quadforge.symmetry_check`
+`quadforge.toggle_original`, `quadforge.guides_new`, `quadforge.symmetry_check`,
+`quadforge.preview_flow`, `quadforge.clear_preview` (ops/preview.py; preview
+objects live in 'QuadForge Previews' and are never valid remesh input)
 
 Panel: View3D sidebar, category "QuadForge".
 

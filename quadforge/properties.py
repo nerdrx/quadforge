@@ -364,8 +364,10 @@ class QF_Settings(bpy.types.PropertyGroup):
     )
     preserve_uvs: BoolProperty(
         name="UVs",
-        description="Re-project every UV layer onto the new topology, keeping "
-                    "island borders crisp",
+        description="Re-project every UV layer onto the new topology. The "
+                    "mapping is island-constrained: faces straddling a UV seam "
+                    "are re-anchored inside the single best island, so no face "
+                    "is ever textured from two islands",
         default=True,
     )
     preserve_weights: BoolProperty(

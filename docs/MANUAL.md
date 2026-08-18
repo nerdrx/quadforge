@@ -35,6 +35,28 @@ settings that produced it.
 
 ---
 
+## Preview Flow
+
+A button, not a setting — it sits right under **Remesh**. It solves only the
+orientation field (about a seventh of a full remesh) and draws it as short
+strokes along the future edge flow, each stroke as long as the quad that will
+land there, sampled so that dense strokes mean small quads. Everything that
+shapes flow shapes the preview: hard edges, marked sharp, materials, UV seams,
+guides, painted/adaptive density, Size Contrast, Detail from Input, Opening
+Rings, symmetry, seed. It always shows the **Native** field — with QuadriFlow+
+selected it is still informative about your feature settings, but QuadriFlow
+follows its own flow.
+
+The preview is a disposable wire object `<name> Flow Preview` in a *QuadForge
+Previews* collection: unselectable, never rendered, replaced on every re-run,
+removed by the `X` next to the button, and never treated as input by Remesh /
+Batch / LODs. Strokes draw one family of the cross field, so a stroke running
+*across* what you expected is the same flow — a 4-RoSy field has no preferred
+family. Exact-symmetry solves bisect the mesh first; the preview solves the
+whole mesh, so the mirror seam itself is not shown.
+
+---
+
 ## Presets
 
 The **Preset** dropdown sits at the top of the panel. Choosing one writes its
@@ -283,7 +305,9 @@ side wins you get a warning naming the count (see
 [Troubleshooting](#warnings-about-your-settings)). To ring them, turn *Keep
 Small Shells* off or raise *Small Shell Limit* — bearing in mind that remeshing
 authored eyes and teeth is usually a worse trade than leaving their openings
-unringed.
+unringed. **Preview Flow** is the cheapest way to check whether rings actually
+reached your openings — if *Keep Small Shells* swallowed them, the preview
+shows no concentric band.
 
 #### Use Guides — `use_guides` (default off) / Guide Collection — `guide_collection`
 Projects the curve and Grease Pencil objects in the guide collection onto the
@@ -331,7 +355,7 @@ discards data.
 | Setting | What it does |
 |---|---|
 | `preserve_boundaries` | Pins open boundary edges (holes, borders) so an open mesh keeps its silhouette. Also passed to the solver, not just the transfer. |
-| `preserve_uvs` | Re-projects every UV layer, keeping island borders crisp. |
+| `preserve_uvs` | Re-projects every UV layer. The mapping is island-constrained: a face that straddles a UV seam gets all its corners re-anchored inside the single island that fits it best, so no output face is ever textured from two islands (on the author's test avatar this cut seam-bleeding faces from 3.9 % to 0.006 %). |
 | `preserve_weights` | Rebuilds all vertex groups and weights, side-aware so mirrored limbs do not bleed into each other. |
 | `preserve_shape_keys` | Rebuilds the whole key stack; slider values are restored afterwards. The remesh always runs on the **rest** shape. |
 | `preserve_materials` | Keeps the slots and re-assigns every face to the material it sat on. |
