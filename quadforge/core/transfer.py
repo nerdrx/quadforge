@@ -43,6 +43,9 @@ _WEIGHT_EPS = 1e-6
 # up UVs.  Large enough to land on the correct side of a UV seam, small enough
 # not to skip across a whole source face.
 _LOOP_INSET = 0.08
+# Two source polygons belong to the same UV region when their shared edge has
+# matching UVs on both sides (in *every* layer) to within this tolerance.
+_UV_SEAM_EPS = 1e-6
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +191,9 @@ class Snapshot:
         self.has_custom_normals = False
 
         self._bvh = None
+        self._uv_regions = None        # per-polygon UV-island id (lazy)
+        self._uv_region_index = None   # (order, start, end) into snap.tris
+        self._uv_region_bvh = {}       # island id -> (BVHTree, global tri ids)
 
     # -- derived ---------------------------------------------------------
     @property
@@ -216,6 +222,7 @@ class Snapshot:
 
     def free(self):
         self._bvh = None
+        self._uv_region_bvh = {}
 
     def __repr__(self):
         return (
@@ -533,6 +540,9 @@ def apply(snapshot, new_obj, s=None):
         'ok': False,
         'uvs': False,
         'uv_layers': 0,
+        'uv_seam_faces': 0,
+        'uv_seam_faces_fixed': 0,
+        'uv_seam_corners_fixed': 0,
         'weights': 0,
         'shape_keys': 0,
         'materials': 0,
@@ -779,6 +789,203 @@ def _apply_shape_keys(snap, new_obj, me, nv, NV, v_tri, v_bary, rep):
     return n
 
 
+def _uv_regions(snap):
+    """Per-source-polygon UV island id (lazily computed, cached on the snapshot).
+
+    Two polygons share an id only when their common edge carries the same UVs on
+    both sides in *every* UV layer, i.e. the texture runs continuously across it.
+    A single partition therefore satisfies all layers at once.
+    """
+    if snap._uv_regions is not None:
+        return snap._uv_regions
+    npo = snap.npolys
+    if npo == 0 or not snap.uv_layers:
+        snap._uv_regions = np.zeros(npo, 'i4')
+        return snap._uv_regions
+
+    starts, totals, lv = snap.loop_starts, snap.loop_totals, snap.loop_verts
+    nl = lv.size
+    lp = np.repeat(np.arange(npo, dtype='i4'), totals)
+    idx = np.arange(nl, dtype='i8')
+    local = idx - np.repeat(starts.astype('i8'), totals)
+    nxt = starts[lp].astype('i8') + (local + 1) % np.maximum(totals[lp], 1)
+
+    # pair up the two loops that share each mesh edge
+    ekey = np.sort(np.stack([lv, lv[nxt]], 1), axis=1)
+    order = np.lexsort((ekey[:, 1], ekey[:, 0]))
+    e = ekey[order]
+    if e.shape[0] < 2:
+        snap._uv_regions = np.arange(npo, dtype='i4')
+        return snap._uv_regions
+    same = np.all(e[1:] == e[:-1], axis=1)
+    la = order[:-1][same]
+    lb = order[1:][same]
+
+    join = np.ones(la.size, bool)
+    for layer in snap.uv_layers:
+        uv = layer['uv']
+        if uv.shape[0] != nl:
+            continue
+        a0, a1 = uv[la], uv[nxt[la]]
+        b0, b1 = uv[lb], uv[nxt[lb]]
+        m1 = ((np.abs(a0 - b1).max(1) < _UV_SEAM_EPS)
+              & (np.abs(a1 - b0).max(1) < _UV_SEAM_EPS))
+        m2 = ((np.abs(a0 - b0).max(1) < _UV_SEAM_EPS)
+              & (np.abs(a1 - b1).max(1) < _UV_SEAM_EPS))
+        join &= (m1 | m2)
+
+    parent = list(range(npo))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    pa = lp[la[join]]
+    pb = lp[lb[join]]
+    for x, y in zip(pa.tolist(), pb.tolist()):
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+    roots = np.fromiter((find(i) for i in range(npo)), 'i4', npo)
+    _u, inv = np.unique(roots, return_inverse=True)
+    snap._uv_regions = inv.astype('i4')
+    return snap._uv_regions
+
+
+def _region_bvh(snap, region):
+    """BVH over just the triangles of one UV island (built once, cached)."""
+    if region in snap._uv_region_bvh:
+        return snap._uv_region_bvh[region]
+    if snap._uv_region_index is None:
+        tri_region = _uv_regions(snap)[snap.tri_poly]
+        order = np.argsort(tri_region, kind='stable')
+        sr = tri_region[order]
+        nreg = int(tri_region.max()) + 1 if tri_region.size else 0
+        rr = np.arange(nreg + 1)
+        snap._uv_region_index = (order, np.searchsorted(sr, rr[:-1]),
+                                 np.searchsorted(sr, rr[:-1], side='right'))
+    order, lo, hi = snap._uv_region_index
+    if region < 0 or region >= lo.size:
+        return None
+    sel = order[lo[region]:hi[region]]
+    if sel.size == 0:
+        snap._uv_region_bvh[region] = None
+        return None
+    tris = snap.tris[sel]
+    used, inv = np.unique(tris, return_inverse=True)
+    try:
+        bvh = BVHTree.FromPolygons(
+            snap.verts[used].tolist(),
+            [tuple(t) for t in inv.reshape(-1, 3).tolist()],
+            all_triangles=True,
+        )
+    except Exception:
+        bvh = None
+    out = (bvh, sel) if bvh is not None else None
+    snap._uv_region_bvh[region] = out
+    return out
+
+
+def _constrain_to_island(snap, l_tri, sample, dist, lp, starts, totals,
+                         centers, lco, rep):
+    """Pull every corner of an output face onto one UV island.
+
+    Sampling each corner independently is what produces seam bleed: a corner
+    just across a UV seam grabs the neighbouring island and the face ends up
+    textured out of two unrelated parts of the layout — a smear across the whole
+    UV space, not a subtle error.
+
+    A face that landed in more than one island re-samples *all* of its corners
+    inside each candidate island and keeps the island that moves the corners
+    least in total, so the face is textured from one continuous piece and the
+    UV shift it costs is the smallest available.
+
+    The island has to be genuinely within reach (roughly the face's own size) for
+    every corner; a face that really does bridge a gap between two shells is left
+    alone rather than dragged across the gap.
+    """
+    npo = starts.size
+    if npo == 0 or lp.size == 0:
+        return l_tri
+    regions = _uv_regions(snap)
+    if regions.size == 0 or int(regions.max()) == 0:
+        return l_tri
+
+    ok = l_tri >= 0
+    reg = np.full(lp.size, -1, 'i4')
+    if ok.any():
+        reg[ok] = regions[snap.tri_poly[l_tri[ok]]]
+
+    # faces whose corners did not agree on an island
+    v = reg >= 0
+    rmin = np.full(npo, 1 << 30, 'i8')
+    rmax = np.full(npo, -1, 'i8')
+    np.minimum.at(rmin, lp[v], reg[v])
+    np.maximum.at(rmax, lp[v], reg[v])
+    faces = np.nonzero((rmax >= 0) & (rmin != rmax))[0]
+    rep['uv_seam_faces'] = int(faces.size)
+    if faces.size == 0:
+        return l_tri
+
+    # how far a corner may travel to reach its face's island
+    extent = np.zeros(npo, 'f8')
+    np.maximum.at(extent, lp, np.linalg.norm(lco - centers[lp], axis=1))
+    guard = 2.0 * extent
+
+    # gather the work: which island has to be probed for which corners
+    corners = {}
+    per_region = {}
+    for f in faces.tolist():
+        ks = list(range(int(starts[f]), int(starts[f]) + int(totals[f])))
+        cands = sorted({int(reg[k]) for k in ks if reg[k] >= 0})
+        if len(cands) < 2:
+            continue
+        corners[f] = (ks, cands)
+        for r in cands:
+            per_region.setdefault(r, []).extend(ks)
+
+    probe = {}
+    for r, ks in per_region.items():
+        got = _region_bvh(snap, r)
+        if got is None:
+            continue
+        bvh, sel = got
+        fn = bvh.find_nearest
+        for i in ks:
+            p = sample[i]
+            hit = fn((float(p[0]), float(p[1]), float(p[2])))
+            if hit is None or hit[2] is None or hit[3] is None:
+                continue
+            probe[(i, r)] = (float(hit[3]), int(sel[int(hit[2])]))
+
+    moved = np.zeros(lp.size, bool)
+    for f, (ks, cands) in corners.items():
+        lim = guard[f]
+        best = None
+        for r in cands:
+            total = 0.0
+            for i in ks:
+                got = probe.get((i, r))
+                if got is None or got[0] > dist[i] + lim:
+                    total = None
+                    break
+                total += got[0]
+            if total is not None and (best is None or total < best[0]):
+                best = (total, r)
+        if best is None:
+            continue
+        for i in ks:
+            tri = probe[(i, best[1])][1]
+            if tri != l_tri[i]:
+                l_tri[i] = tri
+                moved[i] = True
+    rep['uv_seam_corners_fixed'] = int(moved.sum())
+    rep['uv_seam_faces_fixed'] = int(np.unique(lp[moved]).size)
+    return l_tri
+
+
 def _apply_uvs(snap, me, nl, npo, NV, rep):
     """Per-loop UV transfer.
 
@@ -786,6 +993,9 @@ def _apply_uvs(snap, me, nl, npo, NV, rep):
     that loops on opposite sides of a UV seam pick different source triangles;
     the barycentric weights are then evaluated at the *vertex* position on that
     triangle, so the transferred UV is not shifted inwards.
+
+    Corners are then pulled onto a single UV island per face (see
+    ``_constrain_to_island``) so a face is never textured from two islands.
     """
     starts, totals, lverts = _poly_arrays(me)
     centers = _poly_centers(me)
@@ -793,7 +1003,10 @@ def _apply_uvs(snap, me, nl, npo, NV, rep):
     lco = NV[lverts]
     sample = lco + (centers[lp] - lco) * _LOOP_INSET
 
-    l_tri, _ = _nearest_tris(snap, sample)
+    l_tri, l_loc = _nearest_tris(snap, sample)
+    dist = np.linalg.norm(sample - l_loc, axis=1)
+    l_tri = _constrain_to_island(snap, l_tri, sample, dist, lp, starts, totals,
+                                 centers, lco, rep)
     l_bary = _bary(snap, l_tri, lco)
 
     for layer in snap.uv_layers:
