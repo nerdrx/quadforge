@@ -124,13 +124,21 @@ def settings_to_dict(s):
 
 
 def apply_settings(dst, data):
+    """Restore a settings_to_dict() snapshot onto ``dst``.
+
+    The ``preset`` enum is written with its update callback suppressed: the
+    snapshot already carries the exact values, and letting the callback fire
+    would re-apply the preset over caller overrides (LOD targets, for one).
+    """
     if dst is None or not data:
         return
-    for ident, value in data.items():
-        try:
-            setattr(dst, ident, value)
-        except Exception:
-            pass
+    from ..properties import suppress_preset_update
+    with suppress_preset_update():
+        for ident, value in data.items():
+            try:
+                setattr(dst, ident, value)
+            except Exception:
+                pass
 
 
 def copy_settings(src, dst):

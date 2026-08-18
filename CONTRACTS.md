@@ -31,6 +31,10 @@ tests/
 
 `obj.quadforge` → `QF_Settings` with fields:
 
+- preset: Enum ['CUSTOM','GAME_AVATAR','SCULPT_CLEANUP','HARD_SURFACE','QUICK_DRAFT']
+  default CUSTOM — selecting one writes `properties.PRESET_KEYS` once via its update
+  callback (apply-on-select, never reverted; see `properties.PRESETS` and docs/MANUAL.md).
+  Settings copies must wrap writes in `properties.suppress_preset_update()`.
 - target_count: Int, default 5000, min 12
 - mode: Enum ['FACES','RATIO','EDGE'] default FACES
 - target_ratio: Float default 1.0; target_edge_length: Float default 0.1
@@ -41,6 +45,7 @@ tests/
 - detect_hard_edges: Bool default True; hard_edge_angle: Float radians default radians(40)
 - use_marked_sharp: Bool (respect existing sharp/crease/seam as hard edges)
 - use_materials: Bool (material boundaries become preserved edge loops)
+- use_uv_seams: Bool (UV island boundaries become feature edges)
 - use_guides: Bool; guide_collection: PointerProperty(Collection) — curve/GP objects steer flow
 - symmetry_x/symmetry_y/symmetry_z: Bool
 - exact_symmetry: Bool (bisect + remesh half + mirror weld = mathematically exact)
@@ -50,6 +55,9 @@ tests/
 - keep_original: Bool default True (original moved to 'QuadForge Originals' collection, hidden)
 - backend: Enum ['QUADRIFLOW','NATIVE'] default QUADRIFLOW
 - seed: Int
+- preserve_small_shells: Bool default True (small separate shells keep their topology)
+- small_shell_limit: Int default 0 (0 = auto: max(64, 2% of input faces))
+- solver_isolation: Bool default True (QuadriFlow in a killable child process)
 - lod_targets: String, comma-separated face counts, e.g. "8000,2000,500"
 - last_report: String (JSON of last run stats, set by pipeline)
 

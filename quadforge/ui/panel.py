@@ -79,6 +79,8 @@ class VIEW3D_PT_quadforge(bpy.types.Panel):
             return
         s = obj.quadforge
 
+        layout.prop(s, "preset")
+
         row = layout.row()
         row.scale_y = 1.7
         row.operator("quadforge.remesh", text="Remesh", icon='MOD_REMESH')

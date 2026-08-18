@@ -1395,20 +1395,31 @@ _SKIP_COPY = {"rna_type", "last_report"}
 
 
 def copy_settings(src, dst) -> None:
-    """Mirror the QF_Settings values from one object onto another."""
+    """Mirror the QF_Settings values from one object onto another.
+
+    The ``preset`` enum's update callback is suppressed: every covered value is
+    copied explicitly here, so re-applying the preset would only risk clobbering
+    edits the user made after picking it.
+    """
     if src is None or dst is None:
         return
     try:
         props = src.bl_rna.properties
     except Exception:
         return
-    for p in props:
-        if p.identifier in _SKIP_COPY or p.is_readonly:
-            continue
-        try:
-            setattr(dst, p.identifier, getattr(src, p.identifier))
-        except Exception:
-            continue
+    try:
+        from .properties import suppress_preset_update
+    except Exception:  # pragma: no cover - defensive
+        import contextlib
+        suppress_preset_update = contextlib.nullcontext
+    with suppress_preset_update():
+        for p in props:
+            if p.identifier in _SKIP_COPY or p.is_readonly:
+                continue
+            try:
+                setattr(dst, p.identifier, getattr(src, p.identifier))
+            except Exception:
+                continue
 
 
 def _fail(msg, report, t0, s=None):

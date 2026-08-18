@@ -51,6 +51,7 @@ max deviation 0.74% of the body diagonal):
   Remesh a rigged, shape-keyed character and keep working.
 
 **Workflow**
+- **Presets** — Game Avatar / Sculpt Cleanup / Hard Surface / Quick Draft, one click
 - Non-destructive: original is kept in a hidden `QuadForge Originals` collection (one-click toggle)
 - **Batch remesh** all selected objects
 - **LOD generation** — one click, multiple face targets → `_LOD0/1/2` set
@@ -62,6 +63,13 @@ max deviation 0.74% of the body diagonal):
    (or build it yourself with `./package.sh`)
 2. Blender → Edit → Preferences → Add-ons → Install from Disk → pick the zip
 3. Panel appears in the 3D Viewport sidebar (N) → **QuadForge** tab
+
+## Documentation
+
+**[docs/MANUAL.md](docs/MANUAL.md)** — the user manual: every setting explained
+(what it does, when to change it, how the two backends differ), the preset
+table, four workflow walkthroughs, a troubleshooting guide built from the
+warnings the pipeline actually emits, and an FAQ.
 
 ## Test
 
