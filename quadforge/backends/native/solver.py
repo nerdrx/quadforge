@@ -67,6 +67,10 @@ _DEFAULTS = {
     "orient_iters": 20,
     "pos_iters": 20,
     "preserve_boundaries": True,
+    # concentric loops around small closed openings (eye sockets, mouth rims,
+    # ear holes); handled by fields.solve_fields via backends/native/rings.py,
+    # so it only exists on the v2 path
+    "use_opening_rings": False,
     "verbose": False,
 }
 

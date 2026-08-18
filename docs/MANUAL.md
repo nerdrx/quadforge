@@ -186,6 +186,22 @@ source object is already textured and you intend to keep the texture — without
 it, the UV transfer still runs, but island borders can end up cutting across
 quads diagonally.
 
+#### Ring Openings — `use_opening_rings` (default off, Native only)
+Runs concentric edge loops around small closed holes — eye sockets, the rim of
+a mouth bag, ear canals — instead of letting the curvature-aligned flow run
+straight past them. QuadForge finds every closed boundary loop shorter than
+about 15% of the mesh's own scale, skips the symmetry-bisect cut and any large
+open border, and steers the orientation field along the loop's offset rings
+over a band roughly six quads wide. Hand-drawn guides and hard edges still win
+wherever they overlap the band.
+
+Measured on a disc with a hole and a sphere with a hole, the edges inside a
+four-quad band go from 15–21° off the ring direction to 7–9°. On a real head at
+a whole-body face budget the effect is much smaller — an eye socket is only
+about a dozen quads around at 12k faces, which is not enough room for
+concentric loops to read — so treat this as most useful on head-only or
+high-budget remeshes. It is off by default.
+
 #### Use Guides — `use_guides` (default off) / Guide Collection — `guide_collection`
 Projects the curve and Grease Pencil objects in the guide collection onto the
 surface and steers the edge flow along them. **New Guide** creates an empty
@@ -600,6 +616,7 @@ Verified against `quadforge/properties.py` at v0.4.8.
 | `use_marked_sharp` | on |
 | `use_materials` | off |
 | `use_uv_seams` | off |
+| `use_opening_rings` | off |
 | `use_guides` | off |
 | `symmetry_x` / `_y` / `_z` | off |
 | `exact_symmetry` | on |

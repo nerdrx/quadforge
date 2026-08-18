@@ -291,6 +291,16 @@ class QF_Settings(bpy.types.PropertyGroup):
                     "projected path as a hard edge",
         default=False,
     )
+    use_opening_rings: BoolProperty(
+        name="Ring Openings",
+        description="Native backend: run concentric edge loops around small "
+                    "closed holes — eye sockets, mouth rims, ear canals — "
+                    "instead of letting the curvature flow run straight past "
+                    "them. Affects only a few quads' width around each hole; "
+                    "large borders and the symmetry cut are left alone",
+        default=False,
+    )
+
     guide_collection: PointerProperty(
         name="Guide Collection",
         description="Collection whose curve and Grease Pencil objects are used as "

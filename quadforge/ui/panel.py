@@ -129,6 +129,10 @@ class VIEW3D_PT_quadforge(bpy.types.Panel):
         col.prop(s, "use_materials")
         col.prop(s, "use_uv_seams")
 
+        rings = col.column()
+        rings.active = s.backend == 'NATIVE'
+        rings.prop(s, "use_opening_rings")
+
         col.separator()
         col.prop(s, "use_guides")
         sub = col.column(align=True)

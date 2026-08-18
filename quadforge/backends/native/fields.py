@@ -1118,6 +1118,7 @@ class FieldSolution:
     con_dir: np.ndarray = None       # (n,3)
     pin_mask: np.ndarray = None      # (n,)  position-pinned subset (creases)
     guide_mask: np.ndarray = None    # (n,)  vertices carrying a guide direction
+    ring_mask: np.ndarray = None     # (n,)  vertices inside an opening-ring band
     bnd_verts: np.ndarray = None     # (n,)  boundary vertices
     edges: np.ndarray = None         # (e,2) undirected edge list
     levels: list = _dc_field(default=None, repr=False)
@@ -1135,6 +1136,12 @@ FIELD_DEFAULTS = {
     # path is not treated as a crease (see build_constraints)
     "guides_win": True,
     "guide_falloff": 4.0,         # curvature-pull relaxation radius, in quads
+    # concentric loops around eye sockets / mouth rims / ear holes (rings.py)
+    "use_opening_rings": False,
+    "ring_falloff": 6.0,          # band width, in output quads
+    "ring_plateau": 2.0,          # full-strength core of that band
+    "ring_strength": 0.6,         # see rings.RING_DEFAULTS
+    "symmetry": (False, False, False),
     "seed": 0,
     "orient_iters": 20,
     "curvature_smooth": "auto",   # int, or "auto" = derive from rho
@@ -1340,6 +1347,37 @@ def solve_fields(V, F, params=None):
                               density=p.get("density"), adaptive=adaptive,
                               cur=cur, areas=areas)
 
+    # ---- opening rings ---------------------------------------------------
+    # Curvature alignment has nothing useful to say about the collar around an
+    # eye socket or a mouth rim, so the field walks past the hole and the
+    # extractor merely clips a grid against it.  ``rings`` turns each such
+    # opening into the direction an artist would loop there - the tangent of
+    # the iso-distance curve - and writes it into the *soft* alignment channel
+    # in place of the curvature target, with a weight that decays over
+    # ``ring_falloff`` output quads.  That channel is already restricted onto
+    # every hierarchy level and is already 4-RoSy aware, so the ring
+    # instruction survives the coarse-to-fine solve exactly like a curvature
+    # one.  The rim vertices themselves are untouched: they are boundary
+    # vertices, hence already *hard* constrained to the very same direction,
+    # and a hard constraint outranks this channel by construction.  User
+    # guides also keep their vertices - a drawn stroke is an explicit
+    # instruction and outranks an inferred one.
+    ring_mask = np.zeros(n, dtype=bool)
+    if bool(p.get("use_opening_rings", False)):
+        from . import rings as _rings
+        rdirs, rw, ropen = _rings.opening_ring_field(
+            V, F, N, edges, rho, symmetry=tuple(p.get("symmetry") or
+                                                (False, False, False)),
+            params=p)
+        rsel = (rw > 1e-6) & ~con_mask & ~guide_mask
+        if rsel.any():
+            align_dir = np.array(align_dir, dtype=np.float64, copy=True)
+            align_w = np.array(align_w, dtype=np.float64, copy=True)
+            align_dir[rsel] = rdirs[rsel]
+            align_w[rsel] = rw[rsel]
+            ring_mask = rsel
+        p["_ring_openings"] = len(ropen)
+
     # ---- multiresolution 4-RoSy solve ------------------------------------
     levels = build_hierarchy(V, N, indptr, indices, rho, con_mask, con_dir,
                              rng, pin_mask=pin_mask,
@@ -1381,6 +1419,8 @@ def solve_fields(V, F, params=None):
         "n": n, "tris": int(len(F)), "levels": len(levels),
         "curvature_align": ca, "adaptive": adaptive, "curvature_smooth": csm,
         "aligned_verts": int(np.count_nonzero(align_w > 0.05)),
+        "ring_openings": int(p.get("_ring_openings", 0)),
+        "ring_verts": int(np.count_nonzero(ring_mask)),
         "t_topology": t_topo - t0, "t_curvature": t_curv - t_topo,
         "t_hierarchy": t_hier - t_curv, "t_orient": t_orient - t_hier,
         "t_total": t_orient - t0,
@@ -1397,6 +1437,6 @@ def solve_fields(V, F, params=None):
         aniso=cur.aniso, align_w=align_w, align_dir=align_dir,
         k1=cur.k1, k2=cur.k2,
         con_mask=con_mask, con_dir=con_dir, pin_mask=pin_mask,
-        guide_mask=guide_mask,
+        guide_mask=guide_mask, ring_mask=ring_mask,
         bnd_verts=bnd_verts, edges=edges, levels=levels, stats=stats,
     )

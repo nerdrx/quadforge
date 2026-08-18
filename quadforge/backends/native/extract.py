@@ -94,6 +94,10 @@ WELD_EPS = 0.30
 # hole filler
 MAX_ORBIT = 8
 
+# a hole loop longer than MAX_ORBIT whose corners are at least this share
+# boundary samples is a real opening, not a lattice defect (see _fill_holes)
+FILL_BOUNDARY_FRAC = 0.90
+
 # The position lattice is read off the input graph, so an input edge longer
 # than ~1.5 rho cannot produce a lattice step at all: it rounds to an offset
 # of 2+ and is discarded, which strips every face off the under-sampled part
@@ -1711,6 +1715,22 @@ def _fill_holes(P, faces, cbnd):
                 v < len(cbnd) and cbnd[v] for v in loop):
             skipped.append(("boundary", k))
             continue                     # real opening of an open input mesh
+        if cbnd is not None and k > MAX_ORBIT:
+            # ...and "all" is too brittle a test for a *long* loop.  A hole
+            # the filler exists to close is a lattice defect: a missing cell,
+            # never more than an orbit long, and its corners are interior
+            # samples.  A hundred-vertex loop is an opening the extractor
+            # traced correctly, and one corner of it whose cluster happened
+            # not to catch an input boundary vertex is enough to make `all`
+            # fail - at which point the filler fans a centroid across the
+            # entire opening and the mesh is destroyed (measured on a disc
+            # with a hole, orientation field ringed: the outer border came
+            # out 130 boundary corners plus 3 interior ones and was filled
+            # with a 130-spoke fan).  Long loops therefore go by majority.
+            nb = sum(1 for v in loop if v < len(cbnd) and cbnd[v])
+            if nb >= FILL_BOUNDARY_FRAC * k:
+                skipped.append(("boundary~", k))
+                continue
         parts = None
         own = set()
         for b in range(k):
