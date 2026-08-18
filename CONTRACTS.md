@@ -55,6 +55,10 @@ tests/
 - keep_original: Bool default True (original moved to 'QuadForge Originals' collection, hidden)
 - backend: Enum ['QUADRIFLOW','NATIVE'] default QUADRIFLOW
 - seed: Int
+- use_opening_rings: Bool default False (Native only; concentric loops + local density
+  boost around small closed holes; never set by any preset. Pipeline reports
+  ring_openings_solved / ring_openings_preserved and warns when preserved shells
+  hide most openings)
 - preserve_small_shells: Bool default True (small separate shells keep their topology)
 - small_shell_limit: Int default 0 (0 = auto: max(64, 2% of input faces))
 - solver_isolation: Bool default True (QuadriFlow in a killable child process)

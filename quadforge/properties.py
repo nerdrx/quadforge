@@ -292,7 +292,7 @@ class QF_Settings(bpy.types.PropertyGroup):
         default=False,
     )
     use_opening_rings: BoolProperty(
-        name="Ring Openings",
+        name="Opening Rings",
         description="Native backend: run concentric edge loops around small "
                     "closed holes — eye sockets, mouth rims, ear canals — "
                     "instead of letting the curvature flow run straight past "
