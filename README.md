@@ -39,6 +39,8 @@ max deviation 0.74% of the body diagonal):
 - **Material boundaries** become preserved edge loops
 - **Guide curves** — draw Bezier/Grease-Pencil strokes; QuadForge projects them onto the
   surface and aligns edge flow along them
+- **Ring Openings** (experimental, Native) — concentric loops around eye sockets,
+  mouth rims and ear holes instead of a grid clipped by the hole
 - Open-boundary preservation
 
 **Symmetry**

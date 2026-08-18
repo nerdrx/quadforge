@@ -203,6 +203,22 @@ project's subtlest regression).
   stair-step); a segment projector that snapped every query to an endpoint
   because polylines were encoded as degenerate triangles.
 - Q5. The v0.4.4 density regression (below).
+- Q6. `_fill_holes` skipped a traced loop only when **every** corner carried a
+  boundary flag. A genuine large opening whose extraction clusters happened to
+  miss a single input boundary vertex therefore failed that test, and the
+  filler fanned one centroid across the entire hole — valence-67 poles, spiral
+  meshes. Pre-existing since the filler was written, surfaced only by the
+  opening-ring fixtures (§8), and measured firing on ~40% of config×seed
+  combinations on a bordered flat sheet. Loops longer than one lattice orbit
+  are now treated as real openings at **≥90%** boundary corners; the filler's
+  actual job — a missing lattice cell, never more than an orbit long, all of
+  whose corners are interior samples — is untouched. Outputs shifted slightly,
+  for the better (benchmark grid control poles/1k 36.2 → 26.3), so v0.5.2 is
+  deliberately not bit-identical to v0.5.1. The lesson generalises past this
+  filler: an all-corners predicate over individually noisy per-vertex flags is
+  a conjunction of *n* unreliable tests, and it fails catastrophically rather
+  than gracefully — the right shape for noisy evidence is a supermajority
+  threshold.
 
 **The v0.4.4/v0.4.5 confusion — a case study in attribution.** To fix rim
 aliasing, v0.4.4 raised the feature-density amplitude to 2.5×. Metrics local
@@ -293,7 +309,9 @@ determinism measurement.)*
 
 What remains honestly unsolved: semantic loop placement (eyelid rings, mouth
 loops as an artist would draw them) — our curvature alignment follows forms
-but does not *plan* loops; thin-shell silhouettes remain resolution-bound;
+but does not *plan* loops (§8 attacks the ring half of this directly, and
+stalls on resolution rather than on alignment); thin-shell silhouettes remain
+resolution-bound;
 face-count adherence under strongly non-uniform density fields drifts
 (-15%..+1%); and Blender's QuadriFlow remains, at the deepest level, weather. (Two
 further items closed post-campaign in v0.4.7: the off-default
@@ -303,7 +321,89 @@ had been fragile since inception because nothing exercised it: every
 untested path rots — and a per-process nondeterminism in exact-symmetry
 cleanup caused by iterating an id()-hashed BMFace set.)
 
-## 8. Conclusion
+## 8. Opening rings, and what actually blocks semantic loop placement
+
+The first item on §7's unsolved list is the one we then attacked directly, and
+the result is worth reporting precisely because it is half a success.
+
+**Motivation.** A hand-retopologist rings an eye socket, a mouth and a nostril
+with concentric loops, because that is the topology that deforms correctly and
+that is what makes a model read as authored. A 4-RoSy field aligned to
+principal curvature has nothing useful to say there: the collar of surface
+around a hole cut into a smooth form is nearly developable, so its principal
+directions are either isotropic (undefined, and the anisotropy gate correctly
+suppresses them) or inherited from the *larger* form the collar sits on. The
+field therefore walks straight past the hole, the extractor produces a grid
+that is merely **clipped** by the opening, and the quads shear diagonally
+through the socket instead of ringing it. Nothing in the pipeline was wrong;
+the field was simply answering a different question than the artist asks.
+
+**Method.** No new solver machinery. `detect_openings` accepts a *closed*
+boundary loop shorter than 15% of `4·√area` (the perimeter of a square patch
+covering that fraction of the surface — a plane's outer border, an open
+cylinder's ends and the symmetry-bisect cut all sit well above it, eye sockets
+and mouth rims well below) and longer than three output quads. Loops lying
+entirely in a declared symmetry plane are the exact-symmetry bisect cut, not
+openings, and are dropped; a rim that merely *touches* the plane (a mouth bag
+halved by the bisect) is kept, with its in-plane part excluded from the
+distance source so the ring field stays mirror-symmetric. From the union of
+those rims we run a multi-source Bellman–Ford geodesic distance over the
+length-weighted edge graph, clamped to the band width so cost stays local, a
+few Jacobi passes to take the kinks out of the piecewise-linear result, then
+the per-triangle gradient, area-averaged onto vertices, projected into the
+tangent plane and rotated 90°: the tangent of the *offset ring* through each
+vertex, which is the direction a hand-placed loop takes. That direction is
+written into the **existing** soft alignment channel — the one the guide
+system already owns, already 4-RoSy aware, already restricted onto every
+hierarchy level — in place of the curvature target, with a weight decaying
+over `ring_falloff` = 6 output quads behind a `ring_plateau` = 2 full-strength
+core, at `ring_strength` = 0.6 at the rim. The rim vertices themselves are
+left alone (they are boundary vertices, already *hard* constrained to the same
+direction) and user guides keep theirs (a drawn stroke is an explicit
+instruction and outranks an inferred one). Two calibration details earned
+their keep: the strength is deliberately below 1, because the ring count *has*
+to change as the band widens, which needs irregular vertices, which the field
+can only place where it is free to deviate from the ideal polar direction; and
+the geodesic replaced a hop-limited BFS whose hop budget had to be guessed
+from a mean edge length — the mesh around an opening is exactly where a sculpt
+is finest, so a 6-quad band silently stopped at 3.7 quads and the outer half
+of it got no instruction at all.
+
+**Quantitative result.** On the two synthetic fixtures (a disc with a hole, a
+sphere with a polar hole), the median 4-RoSy angle of extracted edges inside a
+four-quad band to the true ring direction falls from **15–21° to 7.4–9.0°**,
+with no valence blow-up at the rim. The orientation field's own residual
+against the ideal ring direction inside the band is **0.04°** — so almost the
+entire remaining 7–9° is paid *after* the field, in lattice extraction and
+regularization, not in the solve.
+
+**The negative result, which is the more useful half.** On the real test
+avatar the effect could not be seen at the budget characters are actually
+remeshed at. At 12k faces a Dinasty eye socket is about **twelve quads
+around**: there is no room for a second and third concentric loop, so a
+perfectly ringed field extracts to something visually indistinguishable from
+the unringed one. At **≥25k** the same solve clearly reads — concentric arcs
+under the lower lid, a ringed nose tip. The finding, stated crisply: for
+semantic loop placement, **resolution, not alignment, is the binding
+constraint.** The field was already right at 12k; the mesh had nowhere to put
+what the field knew. That is why the feature ships off by default, and why we
+resisted the temptation to raise `ring_strength` until *something* visible
+happened — a stronger ring instruction at 12k does not buy loops, it buys
+distortion.
+
+Three levers follow directly from that diagnosis, and are recorded rather than
+implemented: a **density boost inside the ring band** (spend quads where the
+loops are supposed to be, exactly as the feature-density machinery of §3.4
+already does for creases); **pinning the extraction lattice lines to the first
+offset ring**, since the 0.04° residual says the field is not the lossy stage;
+and **preserved-shell interaction** — on the test avatar 7 of the 9
+openings in the head belong to small shells that `preserve_small_shells` keeps
+untouched, so the ring code never sees them at all. That last one is a
+reminder of how features interact in a pipeline that is mostly made of
+defensive exceptions: a correct feature can be measured as inert simply
+because an earlier, also-correct stage removed its input.
+
+## 9. Conclusion
 
 A production-grade retopology tool was built in nine days not because any
 single algorithm was novel — most components are recognizable descendants of

@@ -190,17 +190,30 @@ quads diagonally.
 Runs concentric edge loops around small closed holes — eye sockets, the rim of
 a mouth bag, ear canals — instead of letting the curvature-aligned flow run
 straight past them. QuadForge finds every closed boundary loop shorter than
-about 15% of the mesh's own scale, skips the symmetry-bisect cut and any large
-open border, and steers the orientation field along the loop's offset rings
-over a band roughly six quads wide. Hand-drawn guides and hard edges still win
-wherever they overlap the band.
+15 % of the perimeter of a square patch with the same surface area as the mesh
+(so large open borders and the symmetry-bisect cut are skipped), and steers the
+orientation field along that loop's offset rings over a band roughly six quads
+wide, at full strength for the first two. Hand-drawn guides and hard edges
+still win wherever they overlap the band, and the rim edges themselves are
+pinned as before. **Native backend only** — QuadriFlow has no channel to
+receive this. Off by default.
 
 Measured on a disc with a hole and a sphere with a hole, the edges inside a
-four-quad band go from 15–21° off the ring direction to 7–9°. On a real head at
-a whole-body face budget the effect is much smaller — an eye socket is only
-about a dozen quads around at 12k faces, which is not enough room for
-concentric loops to read — so treat this as most useful on head-only or
-high-budget remeshes. It is off by default.
+four-quad band go from 15–21° off the ring direction to 7–9°. On a real head
+the deciding factor is not the field but the budget: at 12 000 faces for a
+whole body an eye socket is only about a dozen quads around, which is not
+enough room for a second and third loop to read at all, while at **25 000+**
+the same solve visibly carries concentric arcs under the lids. So: turn it on
+for head-only remeshes and for character budgets from roughly 25k up; leave it
+off for game-budget full-body passes, where it costs a little time and changes
+nothing you can see.
+
+One caveat worth knowing before you judge it: if the eyes, mouth bag or ear
+pieces are **separate small shells**, *Keep Small Shells* sets them aside
+untouched and their openings never reach the solver — on a typical avatar head
+most of the holes are in that category. If you want them ringed, they have to
+be part of the shell being solved (or *Keep Small Shells* has to be off, which
+is usually a worse trade).
 
 #### Use Guides — `use_guides` (default off) / Guide Collection — `guide_collection`
 Projects the curve and Grease Pencil objects in the guide collection onto the
@@ -481,7 +494,8 @@ From the project's own honest-limitations list (see
 - **Semantic loop placement.** Curvature alignment follows forms; it does not
   *plan* loops. Eyelid rings, mouth loops and the loops an artist would draw
   around a joint are not planned for you. Use guides, or retopologise those
-  areas by hand.
+  areas by hand. *Ring Openings* is a first, partial answer for the holes
+  specifically, and needs the resolution to show it.
 - **Thin shells are resolution-bound.** Fingers, fur cards, cloth edges below
   the target quad size will lose their silhouette. Raise the count, paint
   density there, or keep them as preserved small shells.
@@ -545,6 +559,7 @@ Feature matrix:
 | Adapt Quad Count edge-loop removal | yes | no |
 | Painted density | post-pass relaxation | in-solver |
 | Guides | auto-switches the solve to Native | full directional steering |
+| Ring Openings | no | yes (experimental) |
 | Deterministic per seed | no | yes |
 | Hang-Safe Solver applies | yes | n/a (cannot hang this way) |
 
