@@ -70,6 +70,10 @@ _DEFAULTS = {
     "verbose": False,
 }
 
+# Sweep/benchmark hook: entries here are merged over the caller's params.
+# Always empty in normal operation - only a test harness writes to it.
+_PARAM_OVERRIDES: dict = {}
+
 
 def _subdivide(V, F, sharp, density, guides):
     """One 1-to-4 midpoint subdivision (the piecewise-linear surface is
@@ -158,6 +162,7 @@ def solve(V, F, params=None):
     for k in ("target_faces", "orient_iters", "pos_iters", "seed", "adaptive"):
         if p.get(k) is None:
             p[k] = _DEFAULTS[k]
+    p.update(_PARAM_OVERRIDES)
 
     t0 = time.time()
     V = np.ascontiguousarray(np.asarray(V, dtype=np.float64).reshape(-1, 3))
@@ -214,7 +219,7 @@ def solve(V, F, params=None):
             sol = _f2.solve_fields(V, F, p2)
             # feature-density boost: thin rims and creases need denser quads
             # than flat regions or their silhouettes alias into jagged steps
-            fb = float(p2.get("feature_density", 2.5))
+            fb = float(p2.get("feature_density", 2.0))
             if fb > 1.0 and sharp_in is not None and len(sharp_in):
                 # Graph-distance falloff, not a binary 2-ring dilation.  A hard
                 # 2.5x step in rho makes the extractor stitch a dense rim to a
@@ -224,8 +229,8 @@ def solve(V, F, params=None):
                 # Holding the boost for `plateau` rings and then decaying it
                 # smoothly removes the bump entirely (profile becomes monotone)
                 # and drops poles in the 4-ring band from 34.5% to 30.9%.
-                plateau = float(p2.get("feature_density_plateau", 1.0))
-                decay = max(float(p2.get("feature_density_decay", 2.5)), 1e-3)
+                plateau = float(p2.get("feature_density_plateau", 2.0))
+                decay = max(float(p2.get("feature_density_decay", 1.5)), 1e-3)
                 nvv = V.shape[0]
                 ed_all = _f.build_edges(F)
                 d = np.full(nvv, np.inf)

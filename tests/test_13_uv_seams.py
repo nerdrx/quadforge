@@ -40,8 +40,8 @@ def run(ctx):
         ev = ev.reshape(-1, 2)
         mid = (co[ev[:, 0]] + co[ev[:, 1]]) / 2
         d = co[ev[:, 0]] - co[ev[:, 1]]
-        near = (np.abs(mid[:, 0]) < 0.09) & (mid[:, 1] < -0.85) & (np.abs(mid[:, 2]) < 0.7)
-        if near.sum() < 10:
+        near = (np.abs(mid[:, 0]) < 0.14) & (mid[:, 1] < -0.8) & (np.abs(mid[:, 2]) < 0.8)
+        if near.sum() < 16:
             c.skip("too few edges near seam to judge (%d)" % int(near.sum()))
         dn = d[near] / (np.linalg.norm(d[near], axis=1, keepdims=True) + 1e-12)
         vertical = np.abs(dn[:, 2]) > 0.8
