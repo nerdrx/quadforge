@@ -16,21 +16,30 @@ What it does that might interest you:
   processes) and a from-scratch field-aligned solver whose edge flow follows
   curvature (brows, muzzles, muscle forms) and beats QuadriFlow on a
   flow-alignment benchmark that ships in the repo.
+- **Preview Flow** — see the edge flow and quad sizing as strokes over your
+  mesh in about a seventh of a solve, before you commit. Iterate on guides
+  and settings in seconds.
 - **Your rig survives.** Shape keys (tested with a 640-key stack), vertex
-  weights, seam-crisp UVs, materials — all re-attached to the new topology.
-  Posed-deformation error measured at ~0.1% of the body diagonal.
+  weights, materials — all re-attached to the new topology. Posed-deformation
+  error measured at ~0.1% of the body diagonal, and the UV transfer is
+  island-constrained: no output face is ever textured from two UV islands.
 - **Hand-authored detail is sacred**: hair cards, teeth, eyes, piercings and
   other small shells keep their original topology instead of becoming blobs.
 - **Exact symmetry** — mathematically mirrored, watertight seam, and features
   near the centerline (inner toes, nose tips) survive the cut.
+- **Opening Rings** (experimental) — concentric loops around eye sockets and
+  mouths, with a local density boost so they close even at game budgets.
+- **Vertex-starved sizing** — Size Contrast opens the coarse:fine quad ratio
+  up to 12× (gradient-limited, no size seams), and Detail from Input reads
+  big faces in *your* mesh as "no detail needed here".
 - Painted density, guide strokes (Native backend), UV-island following,
   hard-edge detection, LOD generation, batch, one-click presets, quality
   reports.
-- **151 automated tests**, three benchmark suites, deterministic per seed,
+- **~200 automated tests**, three benchmark suites, deterministic per seed,
   and a research paper in the repo documenting every bug we found — several
   of them in Blender's own QuadriFlow.
 
-It was built in ~9 days of adversarial testing against real VRChat-style
+It was built in ~10 days of adversarial testing against real VRChat-style
 avatars. It is not a 1:1 Quad Remesher clone — its facial loop placement is
 curvature-driven rather than artist-semantic — but for game avatars, sculpt
 cleanup and LOD work it holds its own, and it's free forever.
