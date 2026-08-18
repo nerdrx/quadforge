@@ -54,6 +54,24 @@ tests/run_all.sh            # headless full suite
 QF_ONLY=symmetry tests/run_all.sh   # filter
 ```
 
+## Backends
+
+- **QuadriFlow+** (default): Blender's bundled solver, hardened — per-shell
+  isolated worker processes (a solver stall can never freeze Blender),
+  auto-repair of T-junctions and pinched vertices, cavity-loss detection and
+  restore, exact symmetry with padded solving.
+- **Native** (recommended for organic/character work): from-scratch
+  field-aligned remesher — curvature-following edge flow (beats QuadriFlow on
+  the flow benchmark), true painted/adaptive density reallocation, watertight
+  99%+-quad extraction, quad regularization and feature-curve fairing,
+  bit-deterministic per seed.
+
+## The story
+
+The full build history — architecture, algorithms, 25+ root-caused defects
+(several in Blender itself), and what nine days of adversarial visual QA
+taught us — is written up in [docs/PAPER.md](docs/PAPER.md).
+
 ## License
 
 GPL-3.0 (same as Blender). Do whatever you want, keep it free.
