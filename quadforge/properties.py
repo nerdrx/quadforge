@@ -390,12 +390,15 @@ class QF_Settings(bpy.types.PropertyGroup):
     )
     preserve_creases: BoolProperty(
         name="Creases",
-        description="Transfer subdivision crease values onto the matching new edges",
+        description="Transfer subdivision crease values: each creased source "
+                    "chain is routed as one connected path of new edges, not "
+                    "sprayed onto every nearby edge",
         default=True,
     )
     preserve_bevel_weights: BoolProperty(
         name="Bevel Weights",
-        description="Transfer bevel weights onto the matching new edges",
+        description="Transfer bevel weights, routed as connected edge paths "
+                    "the same way creases are",
         default=True,
     )
 

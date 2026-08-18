@@ -359,8 +359,8 @@ discards data.
 | `preserve_weights` | Rebuilds all vertex groups and weights, side-aware so mirrored limbs do not bleed into each other. |
 | `preserve_shape_keys` | Rebuilds the whole key stack; slider values are restored afterwards. The remesh always runs on the **rest** shape. |
 | `preserve_materials` | Keeps the slots and re-assigns every face to the material it sat on. |
-| `preserve_creases` | Transfers subdivision creases onto the matching new edges. |
-| `preserve_bevel_weights` | Transfers bevel weights onto the matching new edges. |
+| `preserve_creases` | Transfers subdivision creases. Each creased chain is routed as one connected path through the new edge graph — a crease ring stays a ring instead of becoming disconnected nearby edges. |
+| `preserve_bevel_weights` | Transfers bevel weights, routed as connected edge paths the same way creases are. |
 
 ### Output
 
