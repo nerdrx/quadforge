@@ -6,6 +6,22 @@ Converts any mesh (sculpt, scan, boolean soup, triangulated import) into a clean
 quad, animation-ready mesh — and unlike most remeshers, it brings your **UVs,
 materials, vertex weights and shape keys along** to the new topology.
 
+## What it looks like
+
+Original (left) vs QuadForge remesh (right) on a hand-made avatar — default
+settings, Native backend, exact symmetry. Hair, ruff, teeth and eyes are
+preserved as authored; the body is solved with curvature-following quads:
+
+![original vs remesh](docs/images/dinasty_pair.png)
+![head comparison](docs/images/dinasty_heads.png)
+
+A 29k-face game rig (640 shape keys, 150 vertex groups — all preserved), and
+its accuracy heatmap (blue = surface within a hair of the original,
+max deviation 0.74% of the body diagonal):
+
+![remeshed head](docs/images/rex_head.png)
+![accuracy heatmap](docs/images/rex_heatmap.png)
+
 ## Features
 
 **Remeshing**
