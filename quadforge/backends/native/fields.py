@@ -94,6 +94,44 @@ def face_normals_areas(V, F):
     return cr, ar
 
 
+def vertex_areas(V, F, n=None, areas=None):
+    """Lumped (barycentric) vertex areas - a third of every incident triangle.
+
+    ``sum(vertex_areas(...))`` is the surface area, so ``sum(A_v / rho_v**2)``
+    is the number of ``rho``-sized quads the surface can carry.  That sum is
+    the only honest way to read a face budget off a *non-uniform* ``rho``.
+    """
+    if n is None:
+        n = V.shape[0]
+    if areas is None:
+        _, areas = face_normals_areas(V, F)
+    w = np.zeros(int(n), dtype=np.float64)
+    third = np.asarray(areas, dtype=np.float64) / 3.0
+    for k in range(3):
+        w += np.bincount(F[:, k], weights=third, minlength=int(n))
+    return w
+
+
+def budget_scale(rho, w, target):
+    """Uniform factor that puts ``rho``'s predicted quad count on ``target``.
+
+    A quad of side ``rho_v`` covers ``rho_v**2`` of surface, so the field
+    carries ``pred = sum(w_v / rho_v**2)`` cells and scaling the whole field
+    by ``s`` scales that by ``1/s**2``; ``s = sqrt(pred / target)`` therefore
+    lands it on ``target`` while leaving every *ratio* inside ``rho``
+    untouched - the distribution of detail is preserved, only the total moves.
+
+    Returns 1.0 for a degenerate input (the caller then keeps ``rho`` as is).
+    """
+    rho = np.asarray(rho, dtype=np.float64)
+    pred = float(np.sum(np.asarray(w, dtype=np.float64)
+                        / np.maximum(rho, EPS) ** 2))
+    tgt = float(target)
+    if not np.isfinite(pred) or pred <= 0.0 or not np.isfinite(tgt) or tgt <= 0.0:
+        return 1.0
+    return float(np.sqrt(pred / tgt))
+
+
 def vertex_normals(V, F):
     """Area-weighted vertex normals."""
     n = V.shape[0]
@@ -931,8 +969,15 @@ def target_edge_lengths(V, F, n, target_faces, density=None, adaptive=0.0,
     * ``density`` (1 = neutral, >1 = denser) divides it, exactly as v1,
     * ``adaptive`` in ``[0, 1]`` additionally shrinks ``rho`` where the
       surface curves - ``rho ~ kappa^(-adaptive/2)`` clamped to a 3x band,
-    * the mean of ``rho`` is renormalised back to the base so that density and
-      adaptivity only *redistribute* the face budget.
+    * the field is renormalised so that its *predicted cell count*
+      ``sum(A_v / rho_v**2)`` is the requested one, so density and adaptivity
+      only *redistribute* the face budget.
+
+    Renormalising the *mean* of ``rho`` (what this did before) is not the same
+    thing: the count is driven by ``1/rho**2``, which is convex, so spreading
+    ``rho`` at a fixed mean silently buys extra faces (Jensen).  A uniform
+    ``rho`` is a fixed point of both rules, so nothing changes for inputs
+    without a density attribute or adaptivity.
     """
     if areas is None:
         _, areas = face_normals_areas(V, F)
@@ -956,10 +1001,7 @@ def target_edge_lengths(V, F, n, target_faces, density=None, adaptive=0.0,
             fac = np.clip(kk / ref, 1.0 / 3.0, 3.0) ** (0.5 * a)
             rho = rho / fac
 
-    mean_rho = float(np.mean(rho))
-    if mean_rho > 1e-12:
-        rho *= rho0 / mean_rho
-    return rho
+    return rho * budget_scale(rho, vertex_areas(V, F, n, areas=areas), target)
 
 
 @dataclass

@@ -250,7 +250,22 @@ def solve(V, F, params=None):
                 d[~np.isfinite(d)] = 1e9
                 w = np.exp(-np.maximum(d - plateau, 0.0) / decay)
                 rho2 = np.asarray(sol.rho, dtype=np.float64).copy()
-                sol.rho = rho2 / (1.0 + (fb - 1.0) * w)
+                boosted = rho2 / (1.0 + (fb - 1.0) * w)
+                # Reallocation, not inflation.  Dividing rho by up to `fb`
+                # inside the band multiplies the quad density there by fb^2,
+                # so without a compensating global rescale the *density
+                # profile* silently sets the face budget: measured on the
+                # Rexouium body at a 6240-quad request, a 12000-face-class
+                # sweep of (fb, plateau, decay) moved the solver's own first
+                # extraction between 5.3k and 15.3k quads - a 3x spread from
+                # knobs that are supposed to only move detail around.  Rescale
+                # the whole field back onto the pre-boost cell budget: every
+                # ratio inside rho (and therefore the band's relative gain) is
+                # preserved, the interior pays for the band, and the requested
+                # count survives the profile.
+                wa = _f.vertex_areas(V, F, V.shape[0])
+                pre = float(np.sum(wa / np.maximum(rho2, 1e-12) ** 2))
+                sol.rho = boosted * _f.budget_scale(boosted, wa, pre)
             VQ, FQ = _e2.extract(V, F, sol, p2)
             # accept only a result that plausibly covers the input surface:
             # a collapsed extraction (fragments of the input) must fall back

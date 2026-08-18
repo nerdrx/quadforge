@@ -58,7 +58,14 @@ Pipeline
      is what takes the closed fixtures from ~96% to 100% quads,
    * repeat until no hole and no over-used edge remains.
 
-5. **Relax + reproject.**  3-5 tangent-space Laplacian iterations, each
+5. **Face-count search** (v2 path only).  Steps 1-4 are repeated for a few
+   uniform rescalings of ``rho``, driven by a secant iteration on
+   ``log(count)`` against ``log(scale)``, until the count is within
+   ``COUNT_TOL`` of the request.  The search runs *unpolished* (step 6 moves
+   points and never changes a face), so an attempt costs about half a full
+   extraction and only the winner is finished.
+
+6. **Relax + reproject.**  3-5 tangent-space Laplacian iterations, each
    followed by a projection back onto the nearest input triangle through a
    uniform spatial hash, so repair patches blend in and no output vertex
    drifts off the input surface.  Creases, boundaries and pinned vertices are
@@ -133,6 +140,36 @@ REGULARIZE_TOL = 6e-4
 
 # escalate triangle-annihilation walk length only below this quad ratio
 QUAD_FLOOR = 0.975
+
+# ---- face-count adherence -------------------------------------------------
+# The extracted count answers a uniform rho rescale as count ~ scale**-e.  For
+# an ideal lattice e is exactly 2, but the measured value on real sculpts is
+# 2.2-2.5: the repair stage (doublets, tri-pair fusion, triangle annihilation)
+# deletes a *fraction* of the faces and that fraction grows with the lattice
+# density, so the count falls faster than the cell area.  The old loop assumed
+# e = 2 (scale *= sqrt(ratio)), overshot every correction by 20-25%, and then
+# accepted anything inside a 0.82..1.22 band - so a request could land
+# anywhere in -18%..+22% and exactly where it landed was a function of the
+# density field.  These drive a secant iteration on log(count) vs log(scale)
+# with a tolerance worth the name.
+COUNT_TOL = 0.08              # accept while |count / target - 1| <= this
+COUNT_ATTEMPTS = 4
+# Opening step, before two samples exist to measure e from.  The excess over
+# the ideal 2 is repair loss, and repair loss is exactly what makes the first
+# attempt fall short of the cells its rho field promised - so the shortfall
+# predicts the exponent.  A mesh that realises every predicted cell loses
+# nothing to repair and answers with e = 2; the Dinasty head realises 82% and
+# measures 2.25; the Rexouium body realises 56% and measures 2.58.
+COUNT_E0 = 2.0
+COUNT_E_YIELD = 1.3
+COUNT_E_MIN, COUNT_E_MAX = 1.2, 4.0
+# below this measured exponent the count is not answering the scale at all
+COUNT_E_DEAD = 0.3
+# the count search must not buy faces with surface: an attempt is eligible
+# only if its coverage is within this of the best coverage seen.  Coverage
+# above 1.0 carries no information (repair patches and fan-triangulated
+# n-gons push it past the input area), so it is clamped before comparing.
+COVER_SLACK = 0.02
 
 # Feature-curve fairing.  Pinned crease/boundary chains are smoothed ALONG
 # their own polyline and snapped back onto the input feature curve; a
@@ -2328,7 +2365,14 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
 def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
                   pin_verts=None, reg=None, quad_floor=QUAD_FLOOR,
                   feat_proj=None, corner_pts=None, sym_axes=None,
-                  feat_capture=FEATURE_CAPTURE):
+                  feat_capture=FEATURE_CAPTURE, polish=True, state=None):
+    """Position field -> repaired quad-dominant mesh.
+
+    ``polish=False`` returns the same faces with unfaired, unprojected point
+    positions - all that the face-count search needs, at roughly half the
+    cost.  Pass a dict as ``state`` to receive the pre-polish intermediate,
+    which :func:`_polish_positions` can finish later.
+    """
     n = O.shape[0]
     edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
     if len(edges) == 0:
@@ -2456,6 +2500,39 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
         cpin_full = np.concatenate([cpin, np.zeros(npt - nc, dtype=bool)])
     else:
         cpin_full = cpin
+
+    # The polish stage below moves points and never touches `faces`, so the
+    # face count is already final here.  `state` hands that intermediate out
+    # so the count-adherence search can run attempt after attempt without
+    # paying for fairing and reprojection, and polish only the winner.
+    if state is not None:
+        state.update(P=P, faces=faces, crho_full=crho_full,
+                     cbnd_full=cbnd_full, cpin_full=cpin_full, is_new=is_new)
+    if polish and projector is not None:
+        P = _polish_positions(
+            P, faces, crho_full, cbnd_full, cpin_full, is_new, projector,
+            reg=reg, feat_proj=feat_proj, corner_pts=corner_pts,
+            sym_axes=sym_axes, feat_capture=feat_capture)
+    return _compact(P, faces)
+
+
+def _compact(P, faces):
+    """Drop the points no face uses and reindex."""
+    used = np.zeros(len(P), dtype=bool)
+    for f in faces:
+        used[list(f)] = True
+    remap = np.full(len(P), -1, dtype=np.int64)
+    remap[used] = np.arange(int(used.sum()))
+    return P[used], [tuple(int(remap[v]) for v in f) for f in faces]
+
+
+def _polish_positions(P, faces, crho_full, cbnd_full, cpin_full, is_new,
+                      projector, reg=None, feat_proj=None, corner_pts=None,
+                      sym_axes=None, feat_capture=FEATURE_CAPTURE):
+    """Fairing + surface/feature reprojection of an extracted mesh.
+
+    Point positions only: ``faces`` is read, never rewritten.
+    """
     if projector is not None:
         frozen = cbnd_full | cpin_full
         if feat_proj is not None and feat_capture > 0.0:
@@ -2527,16 +2604,7 @@ def _extract_core(O, Q, N, rho, edges, bnd_verts=None, projector=None,
                     on = np.abs(P[fi][:, ax]) <= tolp
                     if on.any():
                         P[fi[on], ax] = 0.0
-
-    # ---- compact ---------------------------------------------------------
-    used = np.zeros(len(P), dtype=bool)
-    for f in faces:
-        used[list(f)] = True
-    remap = np.full(len(P), -1, dtype=np.int64)
-    remap[used] = np.arange(int(used.sum()))
-    VQ = P[used]
-    FQ = [tuple(int(remap[v]) for v in f) for f in faces]
-    return VQ, FQ
+    return P
 
 
 # --------------------------------------------------------------------------
@@ -2733,13 +2801,16 @@ def extract(V, F, sol, params=None):
     target = int(p.get("target_faces", 0) or 0)
     in_area = float(_tri_areas(V0, F0).sum())
 
-    best = None
-    best_cover = -1.0
+    tol = float(p.get("count_tol", COUNT_TOL))
+    attempts = max(1, int(p.get("attempts", COUNT_ATTEMPTS) or COUNT_ATTEMPTS))
+    tries = []          # (scale, faces, quad fraction, coverage, state)
+    samples = []        # (log scale, log faces), for the secant
+    tried = []          # scales already spent
     scale = 1.0
-    attempts = int(p.get("attempts", 3) or 3)
-    for _a in range(max(1, attempts)):
+    for _a in range(attempts):
         O = _solve_positions(levels, scale, pos_iters)
         _lap("positions")
+        st = {}
         VQ, FQ = _extract_core(O, Q, N, rho * scale, edges,
                                bnd_verts=bnd_verts, projector=projector,
                                pin_verts=pin_mask, reg=p,
@@ -2748,37 +2819,78 @@ def extract(V, F, sol, params=None):
                                feat_proj=feat_proj, corner_pts=corner_pts,
                                sym_axes=sym_axes,
                                feat_capture=float(p.get("feature_capture",
-                                                        FEATURE_CAPTURE)))
+                                                        FEATURE_CAPTURE)),
+                               polish=False, state=st)
         _lap("extract_core")
+        tried.append(scale)
         nf = len(FQ)
         nq = sum(1 for f in FQ if len(f) == 4)
         cover = (_poly_area(VQ, FQ) / in_area) if (nf and in_area > 0) else 0.0
-        # Coverage dominates: a fragmented result that happens to land on the
-        # face target is worthless, so missing surface is penalised hardest.
-        score = 4.0 * max(0.0, 1.0 - cover) - 0.25 * (nq / float(max(nf, 1)))
-        if target > 0:
-            score += abs(np.log(max(nf, 1) / float(target)))
+        if nf and st.get("faces"):
+            tries.append((scale, nf, nq / float(nf), cover, st))
         if _DEBUG:
-            print("   [attempt] scale=%.3f faces=%d quad%%=%.1f cover=%.1f%% "
-                  "score=%.3f" % (scale, nf, 100.0 * nq / max(nf, 1),
-                                  100.0 * cover, score))
-        if best is None or score < best[0]:
-            best = (score, VQ, FQ)
-        prev_cover = best_cover
-        best_cover = max(best_cover, cover)
+            print("   [attempt] scale=%.4f faces=%d quad%%=%.1f cover=%.1f%% "
+                  "err=%+.1f%%" % (scale, nf, 100.0 * nq / max(nf, 1),
+                                   100.0 * cover,
+                                   100.0 * (nf / float(target) - 1.0)
+                                   if target > 0 else 0.0))
         if target <= 0:
             break
         if nf == 0:
             scale *= 0.6
             continue
-        ratio = nf / float(target)
-        # Stop once the face count is on target and coverage is either good or
-        # no longer improving - some inputs (shells too small to carry a quad
-        # ring at any budget) simply cannot reach 95%, and burning two more
-        # full attempts on them is pure latency.
-        if 0.82 <= ratio <= 1.22 and (cover >= 0.95
-                                      or cover <= prev_cover + 0.01):
+        err = float(np.log(nf / float(target)))
+        samples.append((float(np.log(scale)), float(np.log(nf))))
+        if abs(err) <= np.log1p(tol):
             break
-        scale *= float(np.clip(np.sqrt(ratio), 0.55, 1.8))
+        # Secant on log(count) vs log(scale): the previous two samples measure
+        # the local exponent, so the step self-corrects instead of trusting
+        # the ideal-lattice value.  Before there are two of them, start from
+        # the exponent real sculpts show.
+        e = float(np.clip(
+            COUNT_E0 + COUNT_E_YIELD * max(0.0, 1.0 - nf / float(target)),
+            COUNT_E_MIN, COUNT_E_MAX))
+        if len(samples) >= 2:
+            (s1, f1), (s2, f2) = samples[-2], samples[-1]
+            if abs(s2 - s1) > 1e-6:
+                ee = -(f2 - f1) / (s2 - s1)
+                if not np.isfinite(ee):
+                    ee = e
+                if ee < COUNT_E_DEAD:
+                    # the count barely answered a real change of scale: this
+                    # input is saturated (a shell too small to carry another
+                    # quad ring at any budget), and further attempts are pure
+                    # latency for a count that cannot move
+                    break
+                e = float(np.clip(ee, COUNT_E_MIN, COUNT_E_MAX))
+        nxt = scale * float(np.clip(np.exp(err / e), 0.55, 1.8))
+        # a step that lands on a scale already spent buys nothing
+        if any(abs(nxt / s - 1.0) < 5e-3 for s in tried):
+            break
+        scale = nxt
 
-    return best[1], best[2]
+    if not tries:
+        return np.zeros((0, 3)), []
+
+    # Coverage is a veto, not a currency: an attempt that dropped surface is
+    # ineligible however well its face count reads, but among attempts that
+    # all cover the input, the count decides.
+    cov_ref = min(1.0, max(t[3] for t in tries))
+    gate = min(cov_ref, max(0.95, cov_ref - COVER_SLACK)) - 1e-9
+    feasible = [t for t in tries if min(1.0, t[3]) >= gate] or tries
+    if target > 0:
+        pick = min(feasible,
+                   key=lambda t: (abs(np.log(t[1] / float(target))), -t[2]))
+    else:
+        pick = max(feasible, key=lambda t: (min(1.0, t[3]), t[2]))
+    if _DEBUG:
+        print("   [pick] scale=%.4f faces=%d of %d attempt(s)"
+              % (pick[0], pick[1], len(tries)))
+    st = pick[4]
+    P = _polish_positions(
+        st["P"], st["faces"], st["crho_full"], st["cbnd_full"],
+        st["cpin_full"], st["is_new"], projector, reg=p, feat_proj=feat_proj,
+        corner_pts=corner_pts, sym_axes=sym_axes,
+        feat_capture=float(p.get("feature_capture", FEATURE_CAPTURE)))
+    _lap("polish")
+    return _compact(P, st["faces"])
