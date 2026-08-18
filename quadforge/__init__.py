@@ -20,7 +20,7 @@ def _collect_modules():
     mods = []
     from .ops import remesh as _ops_remesh
     mods.append(_ops_remesh)
-    for name in ("paint", "batch", "lods"):
+    for name in ("paint", "batch", "lods", "preview"):
         try:
             mods.append(__import__(f"{__package__}.ops.{name}", fromlist=[name]))
         except ImportError:

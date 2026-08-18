@@ -55,10 +55,23 @@ def alive(obj):
         return False
 
 
+def _is_preview(obj):
+    """True for a quadforge.preview_flow object (never valid solver input)."""
+    try:
+        from . import preview
+    except Exception:
+        return False
+    try:
+        return preview.is_preview(obj)
+    except Exception:
+        return False
+
+
 def selected_meshes(context):
-    objs = [o for o in getattr(context, "selected_objects", []) or [] if o.type == 'MESH']
+    objs = [o for o in getattr(context, "selected_objects", []) or []
+            if o.type == 'MESH' and not _is_preview(o)]
     active = getattr(context, "object", None)
-    if not objs and active is not None and active.type == 'MESH':
+    if not objs and active is not None and active.type == 'MESH' and not _is_preview(active):
         objs = [active]
     return objs
 

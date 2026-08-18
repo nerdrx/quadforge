@@ -85,6 +85,12 @@ class VIEW3D_PT_quadforge(bpy.types.Panel):
         row.scale_y = 1.7
         row.operator("quadforge.remesh", text="Remesh", icon='MOD_REMESH')
 
+        row = layout.row(align=True)
+        row.use_property_split = False
+        row.operator("quadforge.preview_flow", text="Preview Flow",
+                     icon='FORCE_VORTEX')
+        row.operator("quadforge.clear_preview", text="", icon='X')
+
         self.draw_target(layout, s)
         self.draw_edge_loops(layout, s)
         self.draw_symmetry(layout, s)
