@@ -102,6 +102,16 @@ MAX_REFINE_VERTS = 400_000
 # hair cards are dozens of such shells and can be 40% of the surface.  rho is
 # clamped per shell so every shell keeps at least this many quads.
 MIN_SHELL_QUADS = 16.0
+# ...but that floor is a promise the face budget has to pay for: N shells cost
+# N * MIN_SHELL_QUADS quads before a single quad is spent on shape.  With Keep
+# Small Shells off, a 170-shell avatar reaches the solver whole, and at an
+# economy target the promise exceeds the entire budget.  Honouring it anyway
+# drove rho on the tiny shells 18x below the global value, which exploded the
+# conforming refinement (2.7x the triangles, 6x the solve time) and starved the
+# body (measured on Dinasty at target 2000: main shell 1290 -> 546 faces).
+# The floor may therefore claim at most this share of the target; past that
+# every shell gets an equal cut of what is actually available.
+SHELL_FLOOR_SHARE = 0.5
 
 # Output polish.  The extracted lattice is topologically clean but visually
 # jittery (neighbouring quads varying ~2x in area); these drive the fairing
@@ -560,21 +570,34 @@ def _filter_feature_fragments(V, segs, rho, min_segs=FEATURE_MIN_SEGS,
     return out
 
 
-def _clamp_rho_per_shell(V, F, rho, edges, min_quads=MIN_SHELL_QUADS):
-    """Cap ``rho`` per connected shell so no shell extracts to nothing."""
+def _clamp_rho_per_shell(V, F, rho, edges, min_quads=MIN_SHELL_QUADS,
+                         target=0, floor_share=SHELL_FLOOR_SHARE):
+    """Cap ``rho`` per connected shell so no shell extracts to nothing.
+
+    ``target`` is the requested face count.  When the mesh carries more shells
+    than the budget can give ``min_quads`` each, the per-shell floor is scaled
+    down to what the budget can actually afford (see SHELL_FLOOR_SHARE) - an
+    unaffordable floor buys nothing (the shells still cannot be expressed) and
+    costs the rest of the mesh its resolution.
+    """
     n = len(V)
     roots = _union_find(n, edges)
     uniq, comp = np.unique(roots, return_inverse=True)
     if len(uniq) < 2:
         return rho
+    min_quads = float(min_quads)
+    if target > 0:
+        afford = floor_share * float(target) / float(len(uniq))
+        min_quads = min(min_quads, max(1.0, afford))
     ar = _tri_areas(V, F)
     carea = np.bincount(comp[F[:, 0]], weights=ar, minlength=len(uniq))
-    cap = np.sqrt(np.maximum(carea, 0.0) / float(min_quads))
+    cap = np.sqrt(np.maximum(carea, 0.0) / min_quads)
     cap = np.where(cap > 0.0, cap, np.inf)
     out = np.minimum(rho, cap[comp])
     if _DEBUG:
         hit = int((out < rho - 1e-15).sum())
-        print("   [shells] components=%d verts_clamped=%d" % (len(uniq), hit))
+        print("   [shells] components=%d min_quads=%.2f verts_clamped=%d"
+              % (len(uniq), min_quads, hit))
     return out
 
 
@@ -2593,7 +2616,9 @@ def extract(V, F, sol, params=None):
     if p.get("shell_clamp", True):
         rho = _clamp_rho_per_shell(
             V, F, rho, _build_edges(F),
-            min_quads=float(p.get("min_shell_quads", MIN_SHELL_QUADS)))
+            min_quads=float(p.get("min_shell_quads", MIN_SHELL_QUADS)),
+            target=int(p.get("target_faces", 0) or 0),
+            floor_share=float(p.get("shell_floor_share", SHELL_FLOOR_SHARE)))
     if p.get("refine", True):
         # allow one retry step of rho headroom before the lattice gets finer
         V, F, N, Q, rho, sharp = _refine_for_lattice(

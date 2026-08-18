@@ -27,6 +27,10 @@ RESULT_SUFFIX = "_quad"
 
 _AXIS_NAMES = ("X", "Y", "Z")
 
+# An input shell this fraction of whose faces ended up far from the solved
+# surface is treated as dropped and grafted back verbatim (restore_lost_regions).
+SHELL_LOST_FRACTION = 0.75
+
 
 # ---------------------------------------------------------------------------
 # optional sibling modules (owned by other agents - never hard-require them)
@@ -358,9 +362,13 @@ def _clear_plane_interior(bm, ax: int, eps: float, nudge: float) -> int:
         for f in bm.faces:
             if all(on_plane(v) for v in f.verts):
                 flat.add(f)
-        doomed = [f for f in flat
-                  if any(nf is not f and nf not in flat
-                         for e in f.edges for nf in e.link_faces)]
+        # iterate bm.faces (index order), not the set: BMFace sets hash by
+        # id() and their order varies per process, which fed a varying
+        # deletion order to bmesh and made exact-symmetry nondeterministic
+        doomed = [f for f in bm.faces
+                  if f in flat
+                  and any(nf is not f and nf not in flat
+                          for e in f.edges for nf in e.link_faces)]
         if doomed:
             bmesh.ops.delete(bm, geom=doomed, context='FACES')
             bm.verts.ensure_lookup_table()
@@ -535,6 +543,14 @@ def restore_lost_regions(work_obj, pre_mesh, report) -> int:
     when the mesh has open boundaries — e.g. on the bisected half used for
     exact symmetry. Any connected input region whose faces are all far from the
     solved surface is copied back verbatim (original topology) and reported.
+
+    A region is restored when it is either substantial (>= 16 faces well clear
+    of the result) or an ENTIRE input shell the solver left essentially
+    uncovered. The size gate alone used to miss the small-shell case completely:
+    with Keep Small Shells off, hair cards and teeth reach the solver, are too
+    thin for the lattice to express, and vanish — 8 of 9 shells on the plate
+    fixture, 100 of 172 on Dinasty. A whole shell going missing is never noise,
+    whatever its face count, so shells are classified in their own right.
     Returns the number of restored faces."""
     if not len(pre_mesh.polygons) or not len(work_obj.data.polygons):
         return 0
@@ -570,12 +586,36 @@ def restore_lost_regions(work_obj, pre_mesh, report) -> int:
     if not far.any():
         return 0
 
-    # connected components over far faces (vertex adjacency)
     pre_bm = bmesh.new()
     pre_bm.from_mesh(pre_mesh)
     pre_bm.faces.ensure_lookup_table()
-    seen = set()
     lost = set()
+
+    # 1. whole input shells the result does not cover. Judged on the shell, not
+    #    on a component of far faces: a dropped hair card typically still has
+    #    one face grazing the tolerance, and requiring *every* face to be far
+    #    let all of them through.
+    seen = set()
+    for f0 in pre_bm.faces:
+        if f0.index in seen:
+            continue
+        shell = []
+        stack = [f0]
+        seen.add(f0.index)
+        while stack:
+            f = stack.pop()
+            shell.append(f.index)
+            for e in f.edges:
+                for nf in e.link_faces:
+                    if nf.index not in seen:
+                        seen.add(nf.index)
+                        stack.append(nf)
+        if len(shell) >= 3 and float(far[shell].mean()) >= SHELL_LOST_FRACTION:
+            lost.update(shell)
+
+    # 2. partial drops (interior cavities, nested geometry) inside a shell the
+    #    solver did otherwise cover
+    seen = set(lost)
     for fi in np.nonzero(far)[0]:
         if int(fi) in seen:
             continue
@@ -618,6 +658,61 @@ def restore_lost_regions(work_obj, pre_mesh, report) -> int:
     )
     report["restored_faces"] = len(lost)
     return len(lost)
+
+
+def seal_solver_holes(work_obj, ref_mesh, max_loop: int = 12) -> int:
+    """Close small boundary loops the solver tore into a watertight input.
+
+    QuadriFlow reports success and still hands back a torn quad mesh for a shell
+    far below its useful resolution. With Keep Small Shells off every hair card,
+    tooth and button goes through the solver, so those tears end up in the
+    result and read as open seams — and the exact-symmetry mirror cannot close
+    them, because they are nowhere near the symmetry plane.
+
+    Watertight in, watertight out: the pass runs only when the *input* had no
+    boundary at all, so a mesh with genuine openings (a plane, a cloth panel, a
+    half-open mouth bag) is never touched. Only small loops are filled — a large
+    one means a whole region went missing, which is restore_lost_regions' job,
+    not something to cap with an n-gon. Filling adds no vertices, so exact
+    symmetry survives it untouched.
+
+    Returns the number of boundary edges sealed.
+    """
+    if ref_mesh is None or not len(ref_mesh.polygons) or not len(work_obj.data.polygons):
+        return 0
+    ref_bm = bmesh.new()
+    ref_bm.from_mesh(ref_mesh)
+    ref_open = any(len(e.link_faces) == 1 for e in ref_bm.edges)
+    ref_bm.free()
+    if ref_open:
+        return 0
+
+    bm = bmesh.new()
+    bm.from_mesh(work_obj.data)
+    fill = [e for comp in _boundary_loops(bm) if len(comp) <= max_loop
+            for e in comp]
+    if not fill:
+        bm.free()
+        return 0
+    before = sum(1 for e in bm.edges if len(e.link_faces) == 1)
+    try:
+        res = bmesh.ops.holes_fill(bm, edges=fill, sides=max_loop)
+    except Exception:
+        bm.free()
+        return 0
+    # only the new caps get their winding computed; a whole-mesh recalc would
+    # re-run the outward heuristic that fix_orientation exists to replace
+    new_faces = [f for f in (res or {}).get("faces", ()) if f.is_valid]
+    if new_faces:
+        bmesh.ops.recalc_face_normals(bm, faces=new_faces)
+    sealed = before - sum(1 for e in bm.edges if len(e.link_faces) == 1)
+    if sealed <= 0:
+        bm.free()
+        return 0
+    bm.to_mesh(work_obj.data)
+    bm.free()
+    work_obj.data.update()
+    return sealed
 
 
 def fix_orientation(work_obj, ref_mesh) -> int:
@@ -823,6 +918,19 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
                 side_mesh = split_small_shells_aside(work_obj, limit)
                 if side_mesh is not None:
                     report["side_shell_faces"] = len(side_mesh.polygons)
+                    # the target should approximate the TOTAL output:
+                    # deduct preserved faces from the solve budget — but only
+                    # while that leaves a healthy budget; a preserved set
+                    # bigger than the target must not starve the solved
+                    # surface, it just overshoots (with a warning)
+                    side_n = len(side_mesh.polygons)
+                    if side_n <= 0.6 * requested:
+                        requested = requested - side_n
+                        report["solve_budget"] = requested
+                    else:
+                        report.setdefault("warnings", []).append(
+                            "preserved shells (%d faces) approach or exceed "
+                            "the target; total output will overshoot" % side_n)
             except Exception as exc:
                 report.setdefault("warnings", []).append(
                     f"small-shell split failed: {exc}")
@@ -852,6 +960,14 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
             side_mesh = split_small_shells_aside(work_obj, limit)
             if side_mesh is not None:
                 report["side_shell_faces"] = len(side_mesh.polygons)
+                side_n = len(side_mesh.polygons)
+                if side_n <= 0.6 * requested:
+                    requested = requested - side_n
+                    report["solve_budget"] = requested
+                else:
+                    report.setdefault("warnings", []).append(
+                        "preserved shells (%d faces) approach or exceed "
+                        "the target; total output will overshoot" % side_n)
         except Exception as exc:
             report.setdefault("warnings", []).append(
                 f"small-shell split failed: {exc}")
@@ -1104,6 +1220,17 @@ def run_remesh(context, obj, s) -> dict:
                     "their original topology was kept"
                     % (bstats["unsolvable_parts"], bstats.get("unsolvable_part_faces", 0))
                 )
+
+            try:
+                sealed = seal_solver_holes(work, ref_mesh)
+                if sealed:
+                    report["sealed_solver_holes"] = sealed
+                    report["warnings"].append(
+                        "%d boundary edge(s) the solver tore into a watertight "
+                        "input were sealed" % sealed
+                    )
+            except Exception as exc:
+                report["warnings"].append(f"hole sealing failed: {exc}")
 
             try:
                 report["orientation_flipped_faces"] = fix_orientation(work, ref_mesh)

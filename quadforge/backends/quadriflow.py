@@ -374,6 +374,17 @@ def _fuse_stray_tris(mesh) -> int:
     return left
 
 
+def _open_edges(mesh) -> int:
+    """Edges carrying exactly one face. 0 means the mesh is watertight."""
+    if mesh is None or len(mesh.polygons) == 0:
+        return 0
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    n = sum(1 for e in bm.edges if len(e.link_faces) == 1)
+    bm.free()
+    return n
+
+
 def _run_worker_round(part_objs, per_part_kwargs, timeout: float):
     """One child-Blender round over the given parts. Replaces the mesh of every
     part the worker finished (even when a later part stalled). Returns the list
@@ -446,13 +457,32 @@ def _run_worker_round(part_objs, per_part_kwargs, timeout: float):
                     continue
                 old = part.data
                 keep_name = old.name
+                # A shell far below QuadriFlow's useful resolution (a 24-face
+                # hair card, a tooth, a button) is sometimes returned TORN:
+                # the operator reports success but the quad mesh it hands back
+                # has holes the input did not have. Joined into the result that
+                # reads as an open seam, and the exact-symmetry mirror cannot
+                # close it because the tear is nowhere near the plane. Watertight
+                # in must stay watertight out; anything else is treated exactly
+                # like a refusal, so the existing escalation (jittered retry ->
+                # native rescue -> keep the original topology) handles it.
+                was_closed = _open_edges(old) == 0
                 part.data = new_mesh
+                _fuse_stray_tris(new_mesh)
+                if was_closed and _open_edges(new_mesh) > 0:
+                    part.data = old
+                    try:
+                        bpy.data.meshes.remove(new_mesh)
+                    except Exception:
+                        pass
+                    done.pop(part.name, None)
+                    failed.add(part.name)
+                    continue
                 try:
                     bpy.data.meshes.remove(old)
                 except Exception:
                     pass
                 new_mesh.name = keep_name
-                _fuse_stray_tris(new_mesh)
 
     return [p for p in part_objs if p.name not in done], failed
 
@@ -613,11 +643,22 @@ def _solve(context, work_obj, s, stats, **params):
         # Tiny shells can't go below QuadriFlow's per-part floor, so many-part
         # meshes overshoot the total; compensate by re-solving the biggest part
         # (from its original geometry) with the excess subtracted.
+        #
+        # The main body pays that bill, so it needs a floor of its own. With
+        # Keep Small Shells off every hair card and tooth reaches the solver and
+        # burns the 24-face per-part minimum, and the excess this produces could
+        # cut the body's budget by more than half (measured on the plate
+        # fixture: 565 -> 278), which both guts the silhouette and pushes the
+        # solve into the coarse regime where QuadriFlow returns torn geometry.
+        # Overshooting the requested count is the better trade - and it is
+        # already what the floor_overshoot warning above promises the user.
         if not remaining and big_backup is not None:
             actual = sum(len(p.data.polygons) for p in parts)
             excess = actual - total_target
-            rebal_target = per_part[big_part.name]["target_faces"] - excess
-            if excess > max(0.08 * total_target, 40) and rebal_target >= 50:
+            big_share = per_part[big_part.name]["target_faces"]
+            rebal_target = big_share - excess
+            if excess > max(0.08 * total_target, 40) and \
+                    rebal_target >= max(50, 0.5 * big_share):
                 solved_mesh = big_part.data
                 big_part.data = big_backup
                 big_backup = None
