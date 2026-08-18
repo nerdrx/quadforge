@@ -1,5 +1,7 @@
 # QuadForge
 
+[![tests](https://github.com/nerdrx/quadforge/actions/workflows/tests.yml/badge.svg)](https://github.com/nerdrx/quadforge/actions/workflows/tests.yml)
+
 Free auto-retopology addon for Blender 5.2+ — a Quad Remesher replacement.
 
 Converts any mesh (sculpt, scan, boolean soup, triangulated import) into a clean,

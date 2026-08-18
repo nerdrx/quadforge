@@ -1,0 +1,198 @@
+name: tests
+
+# The full headless suite (tests/run_all.sh) on every push to main and every PR.
+# Blender is pinned to the exact build the addon targets (5.2.0 LTS) and cached,
+# so only the first run on a fresh cache pays the ~370 MB download.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push on the same branch/PR makes the in-flight run pointless.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Pinned Blender build. The checksum is the official one published at
+  # https://download.blender.org/release/Blender5.2/blender-5.2.0.sha256
+  # (verified byte-for-byte against the tarball used for local development).
+  BLENDER_VERSION: "5.2.0"
+  BLENDER_SERIES: "5.2"
+  BLENDER_TARBALL: "blender-5.2.0-linux-x64.tar.xz"
+  BLENDER_SHA256: "96f6c181a30f4950607839dc84d42a354b250d8a0231b098b59b7bc69c351c48"
+
+jobs:
+  tests:
+    name: Headless suite (Blender 5.2.0 LTS)
+    runs-on: ubuntu-latest
+    # The suite is ~2 min on a fast workstation; a 2-core runner is a lot
+    # slower, but nowhere near 30 min. A timeout here means something hung.
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Install Blender runtime libraries
+        # Blender links these dynamically even for --background, so they must be
+        # present before the binary will load at all.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libx11-6 libxext6 libxrender1 libxfixes3 libxi6 libxxf86vm1 \
+            libxkbcommon0 libsm6 libice6 libgl1 libglx0 libegl1
+
+      - name: Restore cached Blender ${{ env.BLENDER_VERSION }}
+        id: blender-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/blender
+          # Keyed on the exact tarball checksum: bumping the pinned version
+          # above changes the key, so a stale Blender can never be reused.
+          # Deliberately no restore-keys — a partial match would mean silently
+          # testing against the wrong Blender.
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64-${{ env.BLENDER_SHA256 }}
+
+      - name: Download and verify Blender ${{ env.BLENDER_VERSION }}
+        if: steps.blender-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="https://download.blender.org/release/Blender${BLENDER_SERIES}/${BLENDER_TARBALL}"
+          echo "Cache miss — downloading ${url}"
+          curl -fsSL --retry 3 --retry-delay 5 --retry-connrefused \
+            -o "${RUNNER_TEMP}/${BLENDER_TARBALL}" "$url"
+          echo "${BLENDER_SHA256}  ${RUNNER_TEMP}/${BLENDER_TARBALL}" | sha256sum -c -
+          mkdir -p "${HOME}/blender"
+          tar -xJf "${RUNNER_TEMP}/${BLENDER_TARBALL}" -C "${HOME}/blender"
+          rm -f "${RUNNER_TEMP}/${BLENDER_TARBALL}"
+
+      - name: Verify Blender starts headless
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="${HOME}/blender/blender-${BLENDER_VERSION}-linux-x64/blender"
+          if [ ! -x "$bin" ]; then
+            echo "!! Blender binary missing at $bin" >&2
+            ls -la "${HOME}/blender" || true
+            exit 1
+          fi
+          "$bin" --background --factory-startup --version
+          # run_all.sh reads QF_BLENDER; without it the script falls back to the
+          # maintainer's local path, which does not exist on the runner.
+          echo "QF_BLENDER=$bin" >> "$GITHUB_ENV"
+
+      - name: Run QuadForge headless test suite
+        shell: bash
+        run: |
+          # Not -e: run_all.sh's non-zero exit is the signal we want to forward
+          # deliberately, after the log has been captured for the job summary.
+          set +e
+          tests/run_all.sh 2>&1 | tee "${RUNNER_TEMP}/suite.log"
+          status=${PIPESTATUS[0]}
+          echo "tests/run_all.sh exited ${status}"
+          exit "$status"
+
+      - name: Publish RESULT to job summary
+        if: always()
+        shell: bash
+        run: |
+          log="${RUNNER_TEMP}/suite.log"
+          {
+            echo "## QuadForge headless test suite"
+            echo
+            echo "Blender \`${BLENDER_VERSION}\` · commit \`${GITHUB_SHA:0:8}\`"
+            echo
+            if [ ! -f "$log" ]; then
+              echo "No suite log was produced — the suite step never ran."
+              exit 0
+            fi
+            result="$(grep -E '^RESULT ' "$log" | tail -n 1 || true)"
+            if [ -n "$result" ]; then
+              echo "### \`${result}\`"
+            else
+              echo "### No RESULT line"
+              echo
+              echo "Blender died before the runner could print a summary."
+            fi
+            echo
+            fails="$(grep -E '^FAIL ' "$log" || true)"
+            if [ -n "$fails" ]; then
+              echo "### Failures"
+              echo
+              echo '```'
+              printf '%s\n' "$fails"
+              echo '```'
+              echo
+            fi
+            echo "<details>"
+            echo "<summary>Last 150 log lines</summary>"
+            echo
+            echo '```'
+            tail -n 150 "$log"
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full suite log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: suite-log
+          path: ${{ runner.temp }}/suite.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  package:
+    name: Package addon zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build addon zip
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./package.sh
+          zip="$(ls -1 quadforge-*.zip)"
+          echo "Built ${zip} ($(du -h "$zip" | cut -f1))"
+          echo "zip=${zip}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the zip is installable
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${{ steps.build.outputs.zip }}" <<'PY'
+          import sys, zipfile
+          path = sys.argv[1]
+          z = zipfile.ZipFile(path)
+          bad = z.testzip()
+          assert bad is None, "corrupt member: %s" % bad
+          names = z.namelist()
+          for required in ("quadforge/__init__.py", "quadforge/properties.py",
+                           "quadforge/pipeline.py"):
+              assert required in names, "missing %s" % required
+          assert not any("__pycache__" in n for n in names), "zip carries __pycache__"
+          assert all(n.startswith("quadforge/") for n in names), \
+              "zip must contain exactly one top-level quadforge/ dir"
+          print("%s: %d modules, top-level quadforge/ ok" % (path, len(names)))
+          PY
+
+      - name: Upload addon zip
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build.outputs.zip }}
+          path: ${{ steps.build.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 14
