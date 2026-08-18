@@ -326,6 +326,9 @@ def _any_tangent(N):
     return normalize(alt - N * _dot(alt, N)[:, None])
 
 
+_MISSING = object()
+
+
 def make_solution(N, Q, rho):
     """Tiny stand-in for ``fields.FieldSolution`` (handy in tests)."""
     from types import SimpleNamespace
@@ -334,10 +337,14 @@ def make_solution(N, Q, rho):
                            rho=np.asarray(rho, dtype=np.float64))
 
 
-def _sol_get(sol, name):
+def _sol_get(sol, name, default=_MISSING):
     if isinstance(sol, dict):
-        return sol[name]
-    return getattr(sol, name)
+        if default is _MISSING:
+            return sol[name]
+        return sol.get(name, default)
+    if default is _MISSING:
+        return getattr(sol, name)
+    return getattr(sol, name, default)
 
 
 # --------------------------------------------------------------------------
@@ -3076,6 +3083,28 @@ def extract(V, F, sol, params=None):
             min_quads=float(p.get("min_shell_quads", MIN_SHELL_QUADS)),
             target=int(p.get("target_faces", 0) or 0),
             floor_share=float(p.get("shell_floor_share", SHELL_FLOOR_SHARE)))
+    # ---- opening rings: pin a loop on the first offset contour -----------
+    # The orientation field can only *ask* for concentric loops around an eye
+    # socket; whether the lattice actually closes one is decided here.  When
+    # fields.solve_fields ran the ring machinery it leaves the geodesic
+    # distance to the rims on the solution, and its iso-contour a quad and a
+    # half out is where the first lattice line after the rim wants to be - so
+    # it is handed over as a feature curve and the loop exists by
+    # construction rather than by hoping the field alignment survives.  ``ring_dist`` is None on every solve that did not ask for
+    # rings, so this costs nothing (and imports nothing) by default.
+    ring_dist = _sol_get(sol, "ring_dist", None)
+    if ring_dist is not None and p.get("ring_pin", True):
+        try:
+            from . import rings as _rings
+            rseg = _rings.ring_pin_segments(V, F, ring_dist, rho, params=p)
+        except Exception:
+            rseg = None
+        if rseg is not None and len(rseg):
+            sharp = (rseg if sharp is None or not len(sharp)
+                     else np.unique(np.sort(np.concatenate([sharp, rseg],
+                                                           axis=0), axis=1),
+                                    axis=0))
+
     if p.get("refine", True):
         # allow one retry step of rho headroom before the lattice gets finer
         V, F, N, Q, rho, sharp = _refine_for_lattice(

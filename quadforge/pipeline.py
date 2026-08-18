@@ -255,6 +255,88 @@ def split_small_shells_aside(work_obj, limit: int):
     return side_mesh
 
 
+def _rings_module():
+    try:
+        from .backends.native import rings
+        return rings
+    except Exception:
+        return None
+
+
+def _mesh_area(mesh) -> float:
+    try:
+        return float(analysis.world_area(mesh, Matrix.Identity(4)))
+    except Exception:
+        return 0.0
+
+
+def _count_openings(mesh, area=None, rho_mean=None) -> int:
+    """Small closed boundary loops of ``mesh`` - eye sockets, mouth rims, ear
+    holes - by exactly the rule ``backends.native.rings`` uses.
+
+    Reads the boundary straight off the Blender mesh (an edge belongs to the
+    boundary when exactly one loop references it), so nothing is triangulated
+    and nothing is copied.  ``rho_mean`` is the output quad size the run is
+    heading for; it is what keeps the count honest on a hair-plate mesh, whose
+    two hundred strand-end tubes are boundary loops but are far too small for
+    the solver to ring.  Returns 0 if the native module is unavailable.
+    """
+    rings = _rings_module()
+    if rings is None or not len(mesh.polygons):
+        return 0
+    nl = len(mesh.loops)
+    ne = len(mesh.edges)
+    if not nl or not ne:
+        return 0
+    le = np.empty(nl, dtype=np.int32)
+    mesh.loops.foreach_get("edge_index", le)
+    use = np.bincount(le, minlength=ne)
+    bidx = np.nonzero(use == 1)[0]
+    if not len(bidx):
+        return 0
+    ev = np.empty(ne * 2, dtype=np.int32)
+    mesh.edges.foreach_get("vertices", ev)
+    be = ev.reshape(ne, 2)[bidx].astype(np.int64)
+    co = analysis.verts_co(mesh)
+    if area is None:
+        area = _mesh_area(mesh)
+    return len(rings.detect_openings(co, None, be=be, area=area,
+                                     rho_mean=rho_mean))
+
+
+def _preserved_opening_warning(work_obj, side_mesh, s, report,
+                               requested=0) -> None:
+    """Warn when Opening Rings is on but the openings live on shells that
+    ``preserve_small_shells`` keeps untouched.
+
+    Preserved shells never reach the backend - they are rejoined verbatim -
+    so an eye socket that belongs to one can never be ringed however the
+    feature is tuned, and a user who ticked the box and got nothing deserves
+    to be told which knob is holding it.
+    """
+    if side_mesh is None or not bool(getattr(s, "use_opening_rings", False)):
+        return
+    try:
+        area = _mesh_area(work_obj.data) + _mesh_area(side_mesh)
+        rho = None
+        if area > 0.0 and requested > 0:
+            rho = float(np.sqrt(area / max(int(requested), 12)))
+        # both measured against the *whole* object's area, so "small closed
+        # loop" means the same thing on either side of the split
+        kept = _count_openings(side_mesh, area=area, rho_mean=rho)
+        solved = _count_openings(work_obj.data, area=area, rho_mean=rho)
+    except Exception:
+        return
+    report["ring_openings_preserved"] = kept
+    report["ring_openings_solved"] = solved
+    if kept and kept >= max(1, solved):
+        report.setdefault("warnings", []).append(
+            "Opening Rings: %d of %d openings sit on shells that Preserve "
+            "Small Shells keeps verbatim, so they cannot be ringed - turn "
+            "that option off (or raise Small Shell Limit) to ring them"
+            % (kept, kept + solved))
+
+
 def rejoin_side_mesh(work_obj, side_mesh) -> None:
     bm = bmesh.new()
     bm.from_mesh(work_obj.data)
@@ -948,6 +1030,8 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
                         report.setdefault("warnings", []).append(
                             "preserved shells (%d faces) approach or exceed "
                             "the target; total output will overshoot" % side_n)
+                    _preserved_opening_warning(work_obj, side_mesh, s, report,
+                                               requested)
             except Exception as exc:
                 report.setdefault("warnings", []).append(
                     f"small-shell split failed: {exc}")
@@ -985,6 +1069,8 @@ def run_backend(context, backend, work_obj, s, face_target: int, report: dict,
                     report.setdefault("warnings", []).append(
                         "preserved shells (%d faces) approach or exceed "
                         "the target; total output will overshoot" % side_n)
+                _preserved_opening_warning(work_obj, side_mesh, s, report,
+                                               requested)
         except Exception as exc:
             report.setdefault("warnings", []).append(
                 f"small-shell split failed: {exc}")

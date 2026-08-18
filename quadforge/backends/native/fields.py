@@ -1119,6 +1119,11 @@ class FieldSolution:
     pin_mask: np.ndarray = None      # (n,)  position-pinned subset (creases)
     guide_mask: np.ndarray = None    # (n,)  vertices carrying a guide direction
     ring_mask: np.ndarray = None     # (n,)  vertices inside an opening-ring band
+    ring_dist: np.ndarray = None     # (n,)  geodesic distance to the nearest
+                                     #       opening rim, inf outside the band
+                                     #       (None unless rings are on; the
+                                     #       extractor pins a loop along its
+                                     #       first offset contour)
     bnd_verts: np.ndarray = None     # (n,)  boundary vertices
     edges: np.ndarray = None         # (e,2) undirected edge list
     levels: list = _dc_field(default=None, repr=False)
@@ -1141,6 +1146,9 @@ FIELD_DEFAULTS = {
     "ring_falloff": 6.0,          # band width, in output quads
     "ring_plateau": 2.0,          # full-strength core of that band
     "ring_strength": 0.6,         # see rings.RING_DEFAULTS
+    "ring_density": True,         # local sample-density boost in the band
+    "ring_min_quads": 32.0,       # ...aiming for this many quads around
+    "ring_density_max": 2.0,      # ...never finer than this multiple
     "symmetry": (False, False, False),
     "seed": 0,
     "orient_iters": 20,
@@ -1362,13 +1370,31 @@ def solve_fields(V, F, params=None):
     # and a hard constraint outranks this channel by construction.  User
     # guides also keep their vertices - a drawn stroke is an explicit
     # instruction and outranks an inferred one.
+    #
+    # A direction alone is not enough at a game-avatar budget, though.  On the
+    # Dinasty head at 12k faces the eye socket carries some sixteen quads
+    # around; a "concentric loop" made of sixteen segments that also has to
+    # change its ring count as it grows outwards is a lumpy polygon, and the
+    # instruction is followed without the result reading as eyelid loops.  So
+    # the band also asks for *resolution*: ``rings.ring_density`` raises the
+    # sample density inside it until the opening has ``ring_min_quads`` quads
+    # around, capped, and rescales the whole field back onto the same cell
+    # budget so the interior pays for it rather than the face count.  The
+    # alignment weight is evaluated after that, against the boosted rho, so
+    # ``ring_falloff`` still counts quads that will really exist.
     ring_mask = np.zeros(n, dtype=bool)
+    ring_dist = None
+    ring_info = {}
     if bool(p.get("use_opening_rings", False)):
         from . import rings as _rings
-        rdirs, rw, ropen = _rings.opening_ring_field(
+        bands = _rings.ring_bands(
             V, F, N, edges, rho, symmetry=tuple(p.get("symmetry") or
                                                 (False, False, False)),
             params=p)
+        if not bands.empty and bool(p.get("ring_density", True)):
+            rho, ring_info = _rings.ring_density(bands, V, F, rho,
+                                                 areas=areas, params=p)
+        rdirs, rw = _rings.ring_weights(bands, rho, params=p)
         rsel = (rw > 1e-6) & ~con_mask & ~guide_mask
         if rsel.any():
             align_dir = np.array(align_dir, dtype=np.float64, copy=True)
@@ -1376,7 +1402,11 @@ def solve_fields(V, F, params=None):
             align_dir[rsel] = rdirs[rsel]
             align_w[rsel] = rw[rsel]
             ring_mask = rsel
-        p["_ring_openings"] = len(ropen)
+        if not bands.empty:
+            # handed to the extractor, which turns its first offset contour
+            # into a pinned feature loop (rings.ring_pin_segments)
+            ring_dist = bands.dist
+        p["_ring_openings"] = len(bands.openings)
 
     # ---- multiresolution 4-RoSy solve ------------------------------------
     levels = build_hierarchy(V, N, indptr, indices, rho, con_mask, con_dir,
@@ -1421,6 +1451,7 @@ def solve_fields(V, F, params=None):
         "aligned_verts": int(np.count_nonzero(align_w > 0.05)),
         "ring_openings": int(p.get("_ring_openings", 0)),
         "ring_verts": int(np.count_nonzero(ring_mask)),
+        **ring_info,
         "t_topology": t_topo - t0, "t_curvature": t_curv - t_topo,
         "t_hierarchy": t_hier - t_curv, "t_orient": t_orient - t_hier,
         "t_total": t_orient - t0,
@@ -1437,6 +1468,6 @@ def solve_fields(V, F, params=None):
         aniso=cur.aniso, align_w=align_w, align_dir=align_dir,
         k1=cur.k1, k2=cur.k2,
         con_mask=con_mask, con_dir=con_dir, pin_mask=pin_mask,
-        guide_mask=guide_mask, ring_mask=ring_mask,
+        guide_mask=guide_mask, ring_mask=ring_mask, ring_dist=ring_dist,
         bnd_verts=bnd_verts, edges=edges, levels=levels, stats=stats,
     )

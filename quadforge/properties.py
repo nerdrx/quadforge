@@ -296,8 +296,13 @@ class QF_Settings(bpy.types.PropertyGroup):
         description="Native backend: run concentric edge loops around small "
                     "closed holes — eye sockets, mouth rims, ear canals — "
                     "instead of letting the curvature flow run straight past "
-                    "them. Affects only a few quads' width around each hole; "
-                    "large borders and the symmetry cut are left alone",
+                    "them, and spend a few extra quads there so the loops can "
+                    "actually close (paid for by a marginally coarser rest of "
+                    "the mesh, not by a bigger face count). Affects only a few "
+                    "quads' width around each hole; large borders and the "
+                    "symmetry cut are left alone. Holes on shells that "
+                    "Preserve Small Shells keeps verbatim never reach the "
+                    "solver and so cannot be ringed",
         default=False,
     )
 
