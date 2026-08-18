@@ -290,11 +290,13 @@ What remains honestly unsolved: semantic loop placement (eyelid rings, mouth
 loops as an artist would draw them) — our curvature alignment follows forms
 but does not *plan* loops; thin-shell silhouettes remain resolution-bound;
 face-count adherence under strongly non-uniform density fields drifts
-(-15%..+1%); the off-default `preserve_small_shells=False` path is degraded (open seams,
-regressed unnoticed at v0.4.2/3 because nothing exercised it — every
-untested path rots); the native+symmetry combination leaves exactly one
-non-manifold edge on one test avatar; and Blender's QuadriFlow remains, at
-the deepest level, weather.
+(-15%..+1%); and Blender's QuadriFlow remains, at the deepest level, weather. (Two
+further items closed post-campaign in v0.4.7: the off-default
+`preserve_small_shells=False` path — four independent defects, from workers
+accepting torn output to whole shells evading the restore check, a path that
+had been fragile since inception because nothing exercised it: every
+untested path rots — and a per-process nondeterminism in exact-symmetry
+cleanup caused by iterating an id()-hashed BMFace set.)
 
 ## 8. Conclusion
 
