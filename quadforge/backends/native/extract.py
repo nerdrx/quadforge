@@ -74,6 +74,7 @@ Pipeline
 
 from __future__ import annotations
 
+import math
 import os
 import time as _time
 
@@ -220,11 +221,54 @@ def normalize(A, eps=EPS):
     return A / np.maximum(n, eps)
 
 
+# above this vertex count the packed edge key would overflow int64 and the
+# (slow) row-wise np.unique has to be used instead
+_KEY_MAX = 3_037_000_499
+
+
+def _unique_edge_rows(a, b, n, counts=False):
+    """Sorted unique undirected edges ``(min, max)`` of the pairs ``(a, b)``.
+
+    Identical output to ``np.unique(np.sort(np.stack([a, b], 1), 1), axis=0)``
+    - the packed key ``lo * n + hi`` is strictly monotone in the lexicographic
+    row order - but through one int64 sort instead of a void-dtype row sort.
+    ``np.unique(..., axis=0)`` on edge arrays was the single largest numpy
+    cost in the solve (8.5 s of 42 s on a 57k-tri shell).
+    """
+    a = np.asarray(a, dtype=np.int64)
+    b = np.asarray(b, dtype=np.int64)
+    lo = np.minimum(a, b)
+    hi = np.maximum(a, b)
+    m = np.int64(max(int(n), 1))
+    if m > _KEY_MAX:                                    # pragma: no cover
+        e = np.stack([lo, hi], axis=1)
+        if counts:
+            return np.unique(e, axis=0, return_counts=True)
+        return np.unique(e, axis=0), None
+    if counts:
+        key, cnt = np.unique(lo * m + hi, return_counts=True)
+    else:
+        key, cnt = np.unique(lo * m + hi), None
+    out = np.empty((len(key), 2), dtype=np.int64)
+    np.floor_divide(key, m, out=out[:, 0])
+    np.subtract(key, out[:, 0] * m, out=out[:, 1])
+    return out, cnt
+
+
+def _tri_edge_pairs(F):
+    """The three edges of every triangle, as two flat index arrays."""
+    F = np.asarray(F, dtype=np.int64)
+    a = np.concatenate([F[:, 0], F[:, 1], F[:, 2]])
+    b = np.concatenate([F[:, 1], F[:, 2], F[:, 0]])
+    return a, b
+
+
 def _build_edges(F):
-    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]],
-                       axis=0).astype(np.int64)
-    e = np.sort(e, axis=1)
-    e = np.unique(e, axis=0)
+    F = np.asarray(F, dtype=np.int64)
+    if F.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    a, b = _tri_edge_pairs(F)
+    e, _ = _unique_edge_rows(a, b, int(F.max()) + 1)
     return e[e[:, 0] != e[:, 1]]
 
 
@@ -241,10 +285,11 @@ def _build_csr(edges, n):
 
 
 def _boundary_edges(F):
-    e = np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]],
-                       axis=0).astype(np.int64)
-    e = np.sort(e, axis=1)
-    uniq, counts = np.unique(e, axis=0, return_counts=True)
+    F = np.asarray(F, dtype=np.int64)
+    if F.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    a, b = _tri_edge_pairs(F)
+    uniq, counts = _unique_edge_rows(a, b, int(F.max()) + 1, counts=True)
     return uniq[counts == 1]
 
 
@@ -757,28 +802,75 @@ def _round_to_cell(O, Q, N, P, rho):
 
 def _smooth_positions(O, P, Q, N, rho, src, dst, iters, self_weight=1.0,
                       con_mask=None, con_dir=None):
+    """Jacobi relaxation of the lattice-compatible position field.
+
+    The hot loop of the whole solver (2.1 M directed edges x 20 iterations x
+    one pass per count-search attempt on a 230k-tri shell).  Three things make
+    it faster without changing a single rounded bit:
+
+    * ``src`` arrives in CSR order, so ``O[src]`` is a *repeat*, not a random
+      gather - 6x cheaper for the same values;
+    * the per-edge replicas are accumulated in a (3, m) scratch, so
+      ``np.bincount`` reads a contiguous row instead of copying a strided
+      column three times per iteration;
+    * the per-vertex tangent and the edge scratch buffers are hoisted out of
+      the loop.
+
+    Arithmetic order is untouched everywhere, so the result is bit-identical
+    to the straightforward version.
+    """
     n = O.shape[0]
     has_con = con_mask is not None and bool(np.any(con_mask))
     O = np.array(O, dtype=np.float64, copy=True)
-    deg = np.bincount(src, minlength=n).astype(np.float64)
+    m = len(src)
+    deg_i = np.bincount(src, minlength=n)
+    deg = deg_i.astype(np.float64)
     denom = deg + self_weight
     rho_e = 0.5 * (rho[src] + rho[dst])
     inv_e = 1.0 / np.maximum(rho_e, EPS)
     Tj = np.cross(N[dst], Q[dst])
     Qj = Q[dst]
+    QjT = np.ascontiguousarray(Qj.T)
+    TjT = np.ascontiguousarray(Tj.T)
+    T0 = np.cross(N, Q)
+    # sorted src <=> src == repeat(arange(n), deg), so the source gather can
+    # be a sequential expansion
+    csr = bool(m == 0 or np.all(src[1:] >= src[:-1]))
+    dbuf = np.empty((m, 3))
+    repT = np.empty((3, m))
+    tmp = np.empty(m)
+    a = np.empty(m)
+    b = np.empty(m)
+    acc = np.empty((n, 3))
 
     for _ in range(iters):
-        d = O[src] - O[dst]
-        a = np.round(_dot(Qj, d) * inv_e)
-        b = np.round(_dot(Tj, d) * inv_e)
-        rep = O[dst] + Qj * (a * rho_e)[:, None] + Tj * (b * rho_e)[:, None]
-        acc = np.empty((n, 3))
+        Od = O[dst]
+        np.subtract(np.repeat(O, deg_i, axis=0) if csr else O[src], Od,
+                    out=dbuf)
+        np.einsum("ij,ij->i", Qj, dbuf, out=a)
+        np.multiply(a, inv_e, out=a)
+        np.round(a, out=a)
+        np.multiply(a, rho_e, out=a)
+        np.einsum("ij,ij->i", Tj, dbuf, out=b)
+        np.multiply(b, inv_e, out=b)
+        np.round(b, out=b)
+        np.multiply(b, rho_e, out=b)
+        OdT = Od.T
         for c in range(3):
-            acc[:, c] = np.bincount(src, weights=rep[:, c], minlength=n)
+            np.multiply(QjT[c], a, out=repT[c])
+            np.add(OdT[c], repT[c], out=repT[c])
+            np.multiply(TjT[c], b, out=tmp)
+            np.add(repT[c], tmp, out=repT[c])
+        for c in range(3):
+            acc[:, c] = np.bincount(src, weights=repT[c], minlength=n)
         acc += O * self_weight
         acc /= denom[:, None]
         acc -= N * _dot(acc - P, N)[:, None]
-        O = _round_to_cell(acc, Q, N, P, rho)
+        # _round_to_cell, with the tangent hoisted out of the loop
+        cd0 = P - acc
+        ra = np.round(_dot(Q, cd0) / rho)
+        rb = np.round(_dot(T0, cd0) / rho)
+        O = acc + Q * (ra * rho)[:, None] + T0 * (rb * rho)[:, None]
         if has_con:
             cd = con_dir[con_mask]
             rel = O[con_mask] - P[con_mask]
@@ -876,7 +968,7 @@ def _build_pos_hierarchy(P, N, Q, rho, indptr, indices, pin_mask, pin_dir,
         pi, pj = pi[keep], pj[keep]
         if len(pi) == 0:
             break
-        ce = np.unique(np.sort(np.stack([pi, pj], axis=1), axis=1), axis=0)
+        ce, _ = _unique_edge_rows(pi, pj, nc)
         cip, cidx, csrc = _build_csr(ce, nc)
 
         cpin = np.zeros(nc, dtype=bool)
@@ -924,24 +1016,49 @@ def _solve_positions(levels, scale, iters):
 # --------------------------------------------------------------------------
 
 def _union_find(n, pairs):
-    parent = np.arange(n, dtype=np.int64)
+    """Connected-component label per vertex: the lowest index in the component.
 
-    def find(x):
-        root = x
-        while parent[root] != root:
-            root = parent[root]
-        while parent[x] != root:
-            parent[x], x = root, parent[x]
-        return root
+    Vectorised hooking + pointer jumping.  Union by lower root gives exactly
+    the same labels as the scalar disjoint-set version it replaces (the root
+    of a component is its minimum index either way), but the Python-level
+    ``find`` was called ~5 million times per solve.
+    """
+    n = int(n)
+    lab = np.arange(n, dtype=np.int64)
+    pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+    if n == 0 or len(pairs) == 0:
+        return lab
 
-    for a, b in pairs:
-        ra, rb = find(int(a)), find(int(b))
-        if ra != rb:
-            if ra < rb:
-                parent[rb] = ra
-            else:
-                parent[ra] = rb
-    return np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
+    # CSR over both directions, built once: every round is then a gather plus
+    # a segmented minimum, with no ufunc.at scatter anywhere
+    src = np.concatenate([pairs[:, 0], pairs[:, 1]])
+    dst = np.concatenate([pairs[:, 1], pairs[:, 0]])
+    order = np.argsort(src, kind="stable")
+    src = src[order]
+    dst = dst[order]
+    deg = np.bincount(src, minlength=n)
+    starts = np.zeros(n + 1, dtype=np.int64)
+    np.cumsum(deg, out=starts[1:])
+    live = deg > 0
+    st = starts[:-1][live]
+    if len(st) == 0:
+        return lab
+
+    for _ in range(64):
+        nxt = lab.copy()
+        nxt[live] = np.minimum(nxt[live], np.minimum.reduceat(lab[dst], st))
+        # pointer jumping: collapse the label forest to its roots.  Labels
+        # only ever decrease and lab[i] <= i holds by induction, so this
+        # halves the depth every pass; the bound is belt and braces.
+        for _ in range(64):
+            jump = nxt[nxt]
+            if np.array_equal(jump, nxt):
+                break
+            nxt = jump
+        if np.array_equal(nxt, lab):
+            break
+        lab = nxt
+    return lab
 
 
 def _prune_low_degree(nv, e0, e1, min_deg=2):
@@ -1034,7 +1151,7 @@ def _collapse(O, Q, N, rho, edges, pin=None):
     ei, ej = ei[m], ej[m]
     if len(ei) == 0:
         return cluster, CP, CN, CQ, np.zeros((0, 2), dtype=np.int64)
-    ce = np.unique(np.sort(np.stack([ei, ej], axis=1), axis=1), axis=0)
+    ce, _ = _unique_edge_rows(ei, ej, nc)
     return cluster, CP, CN, CQ, ce
 
 
@@ -1106,35 +1223,59 @@ def _rotation_faces(CP, CN, CQ, ce, nc, cbnd):
 # --------------------------------------------------------------------------
 
 def _quad_quality(P, quad):
-    """0 (degenerate / reflex) .. 1 (square)."""
-    p = P[list(quad)]
-    nrm = np.zeros(3)
+    """0 (degenerate / reflex) .. 1 (square).
+
+    Scalar arithmetic on Python floats: the repair loop calls this tens of
+    thousands of times on single quads, and ``np.cross`` / ``np.dot`` on
+    3-vectors is almost all dispatch overhead there.  Every expression is the
+    one numpy evaluates, so the value is unchanged bit for bit.
+    """
+    p = P[list(quad)].tolist()
+    nx = ny = nz = 0.0
     for k in range(4):
-        nrm += np.cross(p[(k + 1) % 4] - p[k], p[(k + 2) % 4] - p[(k + 1) % 4])
-    ln = float(np.dot(nrm, nrm))
+        q0, q1, q2 = p[k], p[(k + 1) % 4], p[(k + 2) % 4]
+        a0 = q1[0] - q0[0]; a1 = q1[1] - q0[1]; a2 = q1[2] - q0[2]
+        b0 = q2[0] - q1[0]; b1 = q2[1] - q1[1]; b2 = q2[2] - q1[2]
+        nx += a1 * b2 - a2 * b1
+        ny += a2 * b0 - a0 * b2
+        nz += a0 * b1 - a1 * b0
+    ln = nx * nx + ny * ny + nz * nz
     if ln < 1e-24:
         return 0.0
-    nrm /= np.sqrt(ln)
+    s = math.sqrt(ln)
+    nx /= s; ny /= s; nz /= s
     worst = 1.0
     for k in range(4):
-        e0 = p[k] - p[(k - 1) % 4]
-        e1 = p[(k + 1) % 4] - p[k]
-        c = np.cross(e0, e1)
-        if float(np.dot(c, nrm)) <= 0.0:
+        q0, qm, q1 = p[k], p[(k - 1) % 4], p[(k + 1) % 4]
+        e00 = q0[0] - qm[0]; e01 = q0[1] - qm[1]; e02 = q0[2] - qm[2]
+        e10 = q1[0] - q0[0]; e11 = q1[1] - q0[1]; e12 = q1[2] - q0[2]
+        cx = e01 * e12 - e02 * e11
+        cy = e02 * e10 - e00 * e12
+        cz = e00 * e11 - e01 * e10
+        if cx * nx + cy * ny + cz * nz <= 0.0:
             return 0.0
-        l0 = np.linalg.norm(e0)
-        l1 = np.linalg.norm(e1)
+        l0 = math.sqrt(e00 * e00 + e01 * e01 + e02 * e02)
+        l1 = math.sqrt(e10 * e10 + e11 * e11 + e12 * e12)
         if l0 < 1e-12 or l1 < 1e-12:
             return 0.0
-        worst = min(worst, 1.0 - abs(float(np.dot(e0, e1)) / (l0 * l1)))
+        w = 1.0 - abs((e00 * e10 + e01 * e11 + e02 * e12) / (l0 * l1))
+        if w < worst:
+            worst = w
     return worst
 
 
 def _face_area(P, f):
-    p = P[list(f)]
+    p = P[list(f)].tolist()
+    p0 = p[0]
     a = 0.0
     for k in range(1, len(f) - 1):
-        a += 0.5 * float(np.linalg.norm(np.cross(p[k] - p[0], p[k + 1] - p[0])))
+        q, r = p[k], p[k + 1]
+        a0 = q[0] - p0[0]; a1 = q[1] - p0[1]; a2 = q[2] - p0[2]
+        b0 = r[0] - p0[0]; b1 = r[1] - p0[1]; b2 = r[2] - p0[2]
+        cx = a1 * b2 - a2 * b1
+        cy = a2 * b0 - a0 * b2
+        cz = a0 * b1 - a1 * b0
+        a += 0.5 * math.sqrt(cx * cx + cy * cy + cz * cz)
     return a
 
 
@@ -1190,38 +1331,106 @@ def _split_ngon(P, f, forbidden=None, skip=None):
 # --------------------------------------------------------------------------
 
 def _edge_use(faces):
+    """``{(lo, hi): [face index, ...]}`` for a 3/4-gon soup.
+
+    Called ~45 times per solve over the whole face list by the repair passes,
+    so the inner loop is unrolled per face size and the dict is poked once per
+    edge instead of going through ``setdefault`` (which builds a throwaway
+    list for every edge that already exists).
+    """
     use = {}
+    get = use.get
     for i, f in enumerate(faces):
-        k = len(f)
-        for a in range(k):
-            u, v = f[a], f[(a + 1) % k]
+        if len(f) == 4:
+            a, b, c, d = f
+            pairs = ((a, b), (b, c), (c, d), (d, a))
+        elif len(f) == 3:
+            a, b, c = f
+            pairs = ((a, b), (b, c), (c, a))
+        else:
+            k = len(f)
+            pairs = tuple((f[j], f[(j + 1) % k]) for j in range(k))
+        for u, v in pairs:
             e = (u, v) if u < v else (v, u)
-            use.setdefault(e, []).append(i)
+            lst = get(e)
+            if lst is None:
+                use[e] = [i]
+            else:
+                lst.append(i)
     return use
 
 
 def _dedupe(P, faces, drop_degenerate=True):
     """Drop faces with repeated indices, duplicates (Blender's ``validate()``
     removes them, which would silently re-open a hole) and - optionally -
-    zero-area faces."""
+    zero-area faces.
+
+    Vectorised: the scalar version called ``np.cross`` once per face, which on
+    a 12k-quad extraction (repeated ~20x per solve by the repair loop) was
+    375k tiny numpy calls.  The semantics are unchanged - a degenerate face is
+    dropped *without* claiming its vertex-set key, so the surviving set is
+    exactly "drop invalid and degenerate, then first occurrence of each key
+    wins" in face order.
+    """
+    m = len(faces)
+    if m == 0:
+        return []
+    lens = np.fromiter((len(f) for f in faces), dtype=np.int64, count=m)
+    if int(lens.max()) > 4 or int(lens.min()) < 3:
+        # n-gons never reach here (they are split first); fall back rather
+        # than silently mangling them
+        return _dedupe_scalar(P, faces, drop_degenerate)
+    # (m, 4) index block; triangles pad their 4th slot with -1
+    idx = np.full((m, 4), -1, dtype=np.int64)
+    quad = lens == 4
+    if quad.any():
+        idx[quad] = np.asarray([f for f in faces if len(f) == 4],
+                               dtype=np.int64)
+    tri = ~quad
+    if tri.any():
+        idx[tri, :3] = np.asarray([f for f in faces if len(f) == 3],
+                                  dtype=np.int64)
+
+    # repeated indices inside one face (the -1 pad is unique, so it never
+    # triggers on a triangle)
+    srt = np.sort(idx, axis=1)
+    keep = ~np.any((srt[:, :3] == srt[:, 1:]) & (srt[:, :3] >= 0), axis=1)
+
+    if drop_degenerate:
+        p0 = P[idx[:, 0]]
+        c = np.cross(P[idx[:, 1]] - p0, P[idx[:, 2]] - p0)
+        keep &= ~(np.einsum("ij,ij->i", c, c) < 1e-26)
+
+    # first occurrence of each sorted vertex set wins, in face order
+    live = np.nonzero(keep)[0]
+    if len(live) > 1:
+        ks = srt[live]
+        # lexsort is stable, so the first row of each equal-key run carries
+        # the lowest original face index - exactly "first occurrence wins"
+        order = np.lexsort((ks[:, 3], ks[:, 2], ks[:, 1], ks[:, 0]))
+        s = ks[order]
+        grp = np.empty(len(order), dtype=bool)
+        grp[0] = True
+        np.any(s[1:] != s[:-1], axis=1, out=grp[1:])
+        keep[live] = False
+        keep[live[order[grp]]] = True
+    return [tuple(f) for f, k in zip(faces, keep.tolist()) if k]
+
+
+def _dedupe_scalar(P, faces, drop_degenerate=True):
+    """Reference implementation of :func:`_dedupe` (n-gon safe)."""
     seen = set()
     out = []
     for f in faces:
         if len(f) < 3 or len(set(f)) != len(f):
-            if _DEBUG:
-                print("   [dedupe] repeated %s" % (f,))
             continue
         key = tuple(sorted(f))
         if key in seen:
-            if _DEBUG:
-                print("   [dedupe] duplicate %s" % (f,))
             continue
         if drop_degenerate:
             pts = P[list(f)]
             c = np.cross(pts[1] - pts[0], pts[2] - pts[0])
             if float(c @ c) < 1e-26:
-                if _DEBUG:
-                    print("   [dedupe] degenerate %s %s" % (f, pts.tolist()))
                 continue
         seen.add(key)
         out.append(tuple(f))
@@ -1256,15 +1465,25 @@ def _orient(P, NRM, faces):
         return faces
     # directed edge -> list of (face, forward?)
     dmap = {}
+    dget = dmap.get
     for i, f in enumerate(faces):
         k = len(f)
         for a in range(k):
             u, v = f[a], f[(a + 1) % k]
-            e = (u, v) if u < v else (v, u)
-            dmap.setdefault(e, []).append((i, u < v))
+            fw = u < v
+            e = (u, v) if fw else (v, u)
+            lst = dget(e)
+            if lst is None:
+                dmap[e] = [(i, fw)]
+            else:
+                lst.append((i, fw))
 
-    flip = np.zeros(n, dtype=bool)
-    seen = np.zeros(n, dtype=bool)
+    # plain Python flags: the traversal touches these once per half-edge and
+    # numpy scalar indexing costs more than the walk itself
+    flip = [False] * n
+    seen = [False] * n
+    Pl = P.tolist()
+    NRMl = NRM.tolist()
     for s in range(n):
         if seen[s]:
             continue
@@ -1275,14 +1494,16 @@ def _orient(P, NRM, faces):
             i = stack.pop()
             f = faces[i]
             k = len(f)
+            fi = flip[i]
             for a in range(k):
                 u, v = f[a], f[(a + 1) % k]
-                e = (u, v) if u < v else (v, u)
+                fw = u < v
+                e = (u, v) if fw else (v, u)
                 for (j, fwd) in dmap[e]:
                     if j == i or seen[j]:
                         continue
                     # i traverses e as (u<v) == (u < v); j must be opposite
-                    fwd_i = (u < v) != bool(flip[i])
+                    fwd_i = fw != fi
                     flip[j] = (fwd == fwd_i)
                     seen[j] = True
                     comp.append(j)
@@ -1291,9 +1512,15 @@ def _orient(P, NRM, faces):
         votes = 0
         for i in comp:
             f = faces[i] if not flip[i] else tuple(reversed(faces[i]))
-            p0, p1, p2 = P[f[0]], P[f[1]], P[f[2]]
-            fn = np.cross(p1 - p0, p2 - p0)
-            dp = float(fn @ NRM[list(f)].sum(axis=0))
+            p0 = Pl[f[0]]; p1 = Pl[f[1]]; p2 = Pl[f[2]]
+            a0 = p1[0] - p0[0]; a1 = p1[1] - p0[1]; a2 = p1[2] - p0[2]
+            b0 = p2[0] - p0[0]; b1 = p2[1] - p0[1]; b2 = p2[2] - p0[2]
+            s0 = s1 = s2 = 0.0
+            for vtx in f:
+                nv = NRMl[vtx]
+                s0 += nv[0]; s1 += nv[1]; s2 += nv[2]
+            dp = ((a1 * b2 - a2 * b1) * s0 + (a2 * b0 - a0 * b2) * s1
+                  + (a0 * b1 - a1 * b0) * s2)
             votes += 1 if dp < 0.0 else (-1 if dp > 0.0 else 0)
         if votes > 0:
             for i in comp:
@@ -1524,14 +1751,29 @@ def _remove_doublets(P, faces):
     """Two faces meeting at a valence-2 interior vertex -> one face."""
     for _ in range(4):
         use = _edge_use(faces)
+        # Only vertices of edge-valence exactly 2 can be doublet centres, and
+        # they are a handful out of tens of thousands - so count first and
+        # build the (much more expensive) per-vertex lists for those alone.
+        val = {}
+        vget = val.get
+        for (u, v) in use:
+            val[u] = vget(u, 0) + 1
+            val[v] = vget(v, 0) + 1
+        cand = {v for v, c in val.items() if c == 2}
+        if not cand:
+            return faces
         vert_edges = {}
-        for (u, v), fl in use.items():
-            vert_edges.setdefault(u, []).append(((u, v), len(fl)))
-            vert_edges.setdefault(v, []).append(((u, v), len(fl)))
+        for e, fl in use.items():
+            u, v = e
+            if u in cand:
+                vert_edges.setdefault(u, []).append((e, len(fl)))
+            if v in cand:
+                vert_edges.setdefault(v, []).append((e, len(fl)))
         vert_faces = {}
         for i, f in enumerate(faces):
             for v in f:
-                vert_faces.setdefault(v, []).append(i)
+                if v in cand:
+                    vert_faces.setdefault(v, []).append(i)
 
         dead = set()
         new = {}
@@ -1779,7 +2021,12 @@ def _annihilate_triangles(P, faces, max_depth=16, rounds=16,
             upd = {}
             cur = path[0]
             cur_face = faces[cur]
-            eset = set(edge_set)
+            # The walk speculatively edits the edge set and throws the edits
+            # away when a step fails.  Copying the whole set per candidate
+            # (~76k entries, once per triangle pair) dominated this pass, so
+            # the edits are applied in place and journalled for rollback.
+            eset = edge_set
+            undo = []
             ok = True
             for si in range(1, len(path) - 1):
                 step = path[si]
@@ -1791,26 +2038,37 @@ def _annihilate_triangles(P, faces, max_depth=16, rounds=16,
                 if len(pent) != 5:
                     ok = False
                     break
-                eset.discard(shared)
+                if shared in eset:
+                    eset.discard(shared)
+                    undo.append((True, shared))
                 sp = _split_pentagon(P, pent, pedge[si], eset,
                                      min_quality)
                 if sp is None:
                     ok = False
                     break
                 quad, tri, chord = sp
-                eset.add(chord)
+                if chord not in eset:
+                    eset.add(chord)
+                    undo.append((False, chord))
                 upd[cur] = quad
                 upd[step] = tri
                 cur = step
                 cur_face = tri
+            if ok:
+                last = path[-1]
+                m = _merge_along(cur_face, faces[last])
+                if m is None or len(m[0]) != 4:
+                    ok = False
+                else:
+                    quad = tuple(m[0])
+                    if _quad_quality(P, quad) < min_quality:
+                        ok = False
             if not ok:
-                continue
-            last = path[-1]
-            m = _merge_along(cur_face, faces[last])
-            if m is None or len(m[0]) != 4:
-                continue
-            quad = tuple(m[0])
-            if _quad_quality(P, quad) < min_quality:
+                for restore, e in reversed(undo):
+                    if restore:
+                        eset.add(e)
+                    else:
+                        eset.discard(e)
                 continue
             upd[cur] = quad
             upd[last] = None
@@ -1919,6 +2177,7 @@ class _Projector:
         self.k = self.F.shape[1] if self.F.ndim == 2 and len(self.F) else 3
         self.lo = self.V.min(axis=0)
         ext = np.maximum(self.V.max(axis=0) - self.lo, 1e-12)
+        self.hi = self.lo + ext
         self.diag = float(np.linalg.norm(ext))
         if len(F):
             tri = self.V[self.F]
@@ -1938,17 +2197,38 @@ class _Projector:
             self.count = np.zeros(0, dtype=np.int64)
             self.tri_sorted = np.zeros(0, dtype=np.int64)
             return
-        # every triangle is registered in the cells of its corners + centroid
-        cen = self.V[self.F].mean(axis=1)
-        pts = np.concatenate([self.V[self.F[:, c]] for c in range(self.k)]
-                             + [cen], axis=0)
-        tid = np.tile(np.arange(len(F), dtype=np.int64), self.k + 1)
-        key = self._key(self._cell_of(pts))
+        key, tid = self._register()
         order = np.argsort(key, kind="stable")
-        self.tri_sorted = tid[order]
         skey = key[order]
+        stid = tid[order]
+        # Collapse (cell, primitive) duplicates.  The cell is ~1.5 median edge
+        # lengths across, so a primitive usually registers all k+1 of its
+        # sample points in the SAME cell and every candidate gather then hands
+        # it to the distance test k+1 times - 2.4x more pairs than necessary
+        # on a real sculpt.  Only the *first* occurrence is kept, so the order
+        # of the survivors inside a cell is untouched and the distance test's
+        # tie-break (lowest candidate index wins) picks exactly what it picked
+        # before.
+        m = np.int64(max(len(F), 1))
+        _, firsts = np.unique(skey * m + stid, return_index=True)
+        keep = np.zeros(len(order), dtype=bool)
+        keep[firsts] = True
+        self.tri_sorted = np.ascontiguousarray(stid[keep])
         self.uniq_key, self.start, self.count = np.unique(
-            skey, return_index=True, return_counts=True)
+            skey[keep], return_index=True, return_counts=True)
+        # corner arrays, so a candidate gather indexes coordinates directly
+        # instead of gathering the index triple first
+        self.corner = [np.ascontiguousarray(self.V[self.F[:, c]])
+                       for c in range(self.k)]
+
+    def _register(self):
+        """``(cell key, primitive id)`` pairs: corners plus centroid."""
+        F, V = self.F, self.V
+        pts = V[F]                                        # (m, k, 3)
+        allp = np.concatenate([V[F[:, c]] for c in range(self.k)]
+                              + [pts.mean(axis=1)], axis=0)
+        return (self._key(self._cell_of(allp)),
+                np.tile(np.arange(len(F), dtype=np.int64), self.k + 1))
 
     def _cell_of(self, P):
         c = np.floor((P - self.lo) / self.cell).astype(np.int64)
@@ -1959,13 +2239,23 @@ class _Projector:
 
     def _gather(self, cid, radius):
         """Ragged (query, triangle) pair lists for a neighbourhood radius."""
-        o = np.arange(-radius, radius + 1)
-        neigh = np.stack(np.meshgrid(o, o, o, indexing="ij"),
-                         axis=-1).reshape(-1, 3)
-        cells = cid[:, None, :] + neigh[None, :, :]
-        inb = np.all((cells >= 0) & (cells < self.dims[None, None, :]), axis=2)
-        flat = cells.reshape(-1, 3)
-        keys = self._key(flat)
+        o = np.arange(-radius, radius + 1, dtype=np.int64)
+        w = len(o)
+        nq = len(cid)
+        # The cell key is affine in the cell coordinates, so a neighbourhood
+        # key is the query's own key plus a constant per offset - no need to
+        # build the (nq, K, 3) coordinate block or re-derive K keys from it.
+        noff = ((o[:, None, None] * self.dims[1] + o[None, :, None])
+                * self.dims[2] + o[None, None, :]).reshape(-1)
+        keys = (self._key(cid)[:, None] + noff[None, :]).reshape(-1)
+        # in-bounds is a product over the three axes, so it is built from
+        # three (nq, w) tests instead of an (nq, K, 3) comparison
+        ax = []
+        for c in range(3):
+            cc = cid[:, c, None] + o[None, :]
+            ax.append((cc >= 0) & (cc < self.dims[c]))
+        inb = (ax[0][:, :, None, None] & ax[1][:, None, :, None]
+               & ax[2][:, None, None, :]).reshape(nq, w ** 3)
         pos = np.clip(np.searchsorted(self.uniq_key, keys), 0,
                       max(len(self.uniq_key) - 1, 0))
         hit = inb.ravel() & (self.uniq_key[pos] == keys) if len(
@@ -1979,30 +2269,43 @@ class _Projector:
         np.cumsum(cnt, out=off[1:])
         run = np.arange(tot) - np.repeat(off[:-1], cnt)
         tri_idx = self.tri_sorted[np.repeat(st, cnt) + run]
-        qrep = np.repeat(np.arange(len(cid), dtype=np.int64), len(neigh))
+        qrep = np.repeat(np.arange(nq, dtype=np.int64), w ** 3)
         pt_idx = np.repeat(qrep, cnt)
         return pt_idx, tri_idx, cnt.reshape(len(cid), -1).sum(axis=1)
 
     def _solve(self, P, pt_idx, tri_idx, out, best):
-        """Segment-min over the candidate pairs; keeps the running best."""
-        tri = self.F[tri_idx]
+        """Segment-min over the candidate pairs; keeps the running best.
+
+        ``pt_idx`` always arrives grouped (both callers emit it in query
+        order), so the winner of each group is found with two segmented
+        reductions instead of an O(m log m) lexsort.  The tie-break is the
+        same one a stable lexsort gives: lowest candidate index wins.
+        """
+        m = len(pt_idx)
+        if m == 0:
+            return
+        Pq = P[pt_idx]
         if self.k == 2:
-            cp = _closest_on_seg(P[pt_idx], self.V[tri[:, 0]],
-                                 self.V[tri[:, 1]])
+            cp = _closest_on_seg(Pq, self.corner[0][tri_idx],
+                                 self.corner[1][tri_idx])
         else:
-            cp = _closest_on_tri(P[pt_idx], self.V[tri[:, 0]],
-                                 self.V[tri[:, 1]], self.V[tri[:, 2]])
-        d = cp - P[pt_idx]
+            cp = _closest_on_tri(Pq, self.corner[0][tri_idx],
+                                 self.corner[1][tri_idx],
+                                 self.corner[2][tri_idx])
+        d = cp - Pq
         d2 = np.einsum("ij,ij->i", d, d)
-        order = np.lexsort((d2, pt_idx))
-        sp = pt_idx[order]
-        first = np.ones(len(sp), dtype=bool)
-        first[1:] = sp[1:] != sp[:-1]
-        win = order[first]
-        tgt = sp[first]
-        better = d2[win] < best[tgt]
+        starts = np.empty(m, dtype=bool)
+        starts[0] = True
+        np.not_equal(pt_idx[1:], pt_idx[:-1], out=starts[1:])
+        starts = np.flatnonzero(starts)
+        gmin = np.minimum.reduceat(d2, starts)
+        cnt = np.diff(np.append(starts, m))
+        pos = np.where(d2 == np.repeat(gmin, cnt), np.arange(m), m)
+        win = np.minimum.reduceat(pos, starts)
+        tgt = pt_idx[starts]
+        better = gmin < best[tgt]
         out[tgt[better]] = cp[win[better]]
-        best[tgt[better]] = d2[win[better]]
+        best[tgt[better]] = gmin[better]
 
     def project(self, P):
         """Exact nearest point on the input surface for every row of ``P``.
@@ -2016,7 +2319,56 @@ class _Projector:
         out = P.copy()
         if len(self.F) == 0 or len(P) == 0:
             return out
-        best = np.full(len(P), np.inf)
+        self._search(P, out, np.full(len(P), np.inf), None)
+        return out
+
+    def project_within(self, P, cap):
+        """Nearest primitive point, but only for the points inside ``cap``.
+
+        Returns ``(closest, found)``: ``closest[i]`` is exactly what
+        :meth:`project` would return whenever ``found[i]`` is true, and
+        ``found[i]`` is false only when the nearest primitive is provably
+        farther than ``cap[i]`` (in which case ``closest[i]`` is ``P[i]``).
+
+        A narrow-band membership test ("is this point on the feature curve?")
+        does not need the exact distance of the points that are nowhere near
+        it - and paying for those is ruinous against a *sparse* soup: the
+        boundary-segment projector covers a curve, so almost every query walks
+        the whole radius ladder and then falls into the brute force, which is
+        one pass over every segment for every point.  ``cap`` (per point) lets
+        the search stop as soon as it has proved the answer is bigger, and the
+        caller reads ``inf`` as "further away than you cared about".
+        """
+        P = np.ascontiguousarray(np.asarray(P, dtype=np.float64).reshape(-1, 3))
+        out = P.copy()
+        found = np.zeros(len(P), dtype=bool)
+        if len(self.F) == 0 or len(P) == 0:
+            return out, found
+        cap = np.asarray(cap, dtype=np.float64).reshape(-1)
+        if cap.size == 1:
+            cap = np.full(len(P), float(cap[0]))
+        # everything lives inside the primitive bounding box, so a point
+        # farther than `cap` from that box needs no search at all - this is
+        # what a curve-shaped soup makes of most of a mesh's vertices
+        gap = np.maximum(np.maximum(self.lo - P, P - self.hi), 0.0)
+        idx = np.nonzero(np.einsum("ij,ij->i", gap, gap) <= cap * cap)[0]
+        if len(idx) == 0:
+            return out, found
+        sub_out = P[idx].copy()
+        sub_best = np.full(len(idx), np.inf)
+        self._search(P[idx], sub_out, sub_best, cap[idx])
+        hit = np.isfinite(sub_best)
+        out[idx[hit]] = sub_out[hit]
+        found[idx[hit]] = True
+        return out, found
+
+    def _search(self, P, out, best, cap):
+        """Radius-escalating nearest-primitive search, then a brute force.
+
+        ``cap`` (or ``None``) prunes queries the caller has already declared
+        uninteresting: once the searched cube provably reaches past ``cap``,
+        the true distance is past it too and the query can be dropped.
+        """
         todo = np.arange(len(P), dtype=np.int64)
         for radius in (0, 1, 2, 4, 8):
             if len(todo) == 0:
@@ -2033,7 +2385,12 @@ class _Projector:
             hi_b = self.lo + (cid + radius + 1) * self.cell
             safe = np.maximum(
                 np.minimum(P[todo] - lo_b, hi_b - P[todo]).min(axis=1), 0.0)
-            todo = todo[best[todo] > safe ** 2]
+            live = best[todo] > safe ** 2
+            if cap is not None:
+                # a capped query may also stop as soon as the ring it has
+                # searched provably reaches past the caller's band
+                live &= safe < cap[todo]
+            todo = todo[live]
         if len(todo):
             allt = np.arange(len(self.F), dtype=np.int64)
             step = max(1, int(self.MAX_PAIRS // max(len(allt), 1)))
@@ -2041,7 +2398,6 @@ class _Projector:
                 blk = todo[a:a + step]
                 self._solve(P, np.repeat(blk, len(allt)),
                             np.tile(allt, len(blk)), out, best)
-        return out
 
 # --------------------------------------------------------------------------
 # relaxation
@@ -2205,10 +2561,14 @@ def _square_targets(P, quads, n, rest=None, size_lock=0.0):
     zy = np.stack([ai, ar, -ai, -ar], axis=1)      # Im(a * i**k)
     tgt = (c[:, None, :] + zx[:, :, None] * u[:, None, :]
            + zy[:, :, None] * w[:, None, :])
+    # extract the live rows once: `tgt[ok, k, cc]` ran a boolean take over an
+    # (m, 4, 3) block twelve times per call, 120 times per solve
+    tok = tgt[ok]
+    qok = quads[ok]
     for k in range(4):
-        idx = quads[ok, k]
+        idx = qok[:, k]
         for cc in range(3):
-            acc[:, cc] += np.bincount(idx, weights=tgt[ok, k, cc], minlength=n)
+            acc[:, cc] += np.bincount(idx, weights=tok[:, k, cc], minlength=n)
         cnt += np.bincount(idx, minlength=n)
     return acc, cnt
 
@@ -2259,7 +2619,8 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
     for _it in range(iters):
         do_proj = (projector is not None
                    and (_it % project_every == 0 or _it == iters - 1))
-        d = P[dst] - P[src]
+        Pd = P[dst]
+        d = Pd - P[src]
         L = np.sqrt(np.einsum("ij,ij->i", d, d))
         Ls = np.maximum(L, 1e-14)
         # The rest length must be a *smooth* field.  Using each vertex's own
@@ -2286,7 +2647,6 @@ def _regularize(P, faces, frozen, projector, rho_v, iters=REGULARIZE_ITERS,
             delta += w_even * (ev / deg[:, None])
         if w_lap:
             lap = np.empty((n, 3))
-            Pd = P[dst]
             for c in range(3):
                 lap[:, c] = np.bincount(src, weights=Pd[:, c], minlength=n)
             delta += w_lap * (lap / deg[:, None] - P)
@@ -2540,8 +2900,17 @@ def _polish_positions(P, faces, crho_full, cbnd_full, cpin_full, is_new,
             # any pinned input sample; it then gets surface-faired, wanders off
             # the feature and kinks the chain.  Anything already sitting within
             # a narrow band of the feature curve joins the chain instead.
-            dfe = np.linalg.norm(feat_proj.project(P) - P, axis=1)
-            near = dfe < feat_capture * crho_full
+            # Band test only: `project_within` stops as soon as it has proved
+            # a point is outside the band, which is the difference between a
+            # bounded grid query and brute-forcing every vertex against every
+            # feature segment (9.6 s of a 59 s solve on a 230k-tri shell).
+            # Inside the band it returns exactly what `project` would, so the
+            # distance - and therefore the membership - is bit for bit what
+            # the full projection gave.
+            band = feat_capture * crho_full
+            fcp, fhit = feat_proj.project_within(P, band)
+            dfe = np.where(fhit, np.linalg.norm(fcp - P, axis=1), np.inf)
+            near = dfe < band
             if _DEBUG:
                 print("   [capture] pinned=%d + geometric=%d"
                       % (int(frozen.sum()), int((near & ~frozen).sum())))

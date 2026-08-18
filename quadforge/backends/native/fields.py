@@ -564,10 +564,17 @@ def smooth_orientations(Q, N, src, dst, con_mask, con_dir, iters,
         aw = np.asarray(align_w, dtype=np.float64).reshape(n)[:, None]
         ad = np.asarray(align_dir, dtype=np.float64).reshape(n, 3)
 
+    # sorted src <=> src == repeat(arange(n), deg): the source-side gather is
+    # then a sequential expansion instead of a random gather (same values,
+    # several times cheaper on the million-edge levels)
+    deg_i = np.bincount(src, minlength=n)
+    csr = bool(len(src) == 0 or np.all(src[1:] >= src[:-1]))
+    Nd = N[dst]
+
     for _ in range(iters):
-        qi = Q[src]
+        qi = np.repeat(Q, deg_i, axis=0) if csr else Q[src]
         qj = Q[dst]
-        perp = np.cross(N[dst], qj)
+        perp = np.cross(Nd, qj)
         d0 = _dot(qj, qi)
         d1 = _dot(perp, qi)
         use1 = np.abs(d1) > np.abs(d0)
@@ -576,8 +583,9 @@ def smooth_orientations(Q, N, src, dst, con_mask, con_dir, iters,
         rep = rep * np.where(sg < 0.0, -1.0, 1.0)[:, None]
 
         acc = np.empty((n, 3))
+        repT = np.ascontiguousarray(rep.T)
         for d in range(3):
-            acc[:, d] = np.bincount(src, weights=rep[:, d], minlength=n)
+            acc[:, d] = np.bincount(src, weights=repT[d], minlength=n)
         acc += Q * self_weight
         acc /= denom[:, None]
         acc -= N * _dot(acc, N)[:, None]
