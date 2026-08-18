@@ -243,9 +243,12 @@ instrument until the numbers explain it.
   honest failures redirected the effort profitably. Conversely, the biggest
   wasted hours came from the orchestrator (this author) trusting green
   fixtures over a red-flagged perception.
-- **L5. Determinism must be designed for and measured.** QuadriFlow's hidden
-  non-reproducibility leaked into flaky tests and was initially amplified by
-  order-dependent set iteration in our own weld code. The native solver is
+- **L5. Determinism must be designed for and measured.** QuadriFlow's
+  reproducibility turned out to be *input-dependent* — bit-identical across
+  five runs on some meshes, genuinely varying on others (a symmetric UV
+  sphere) — which first leaked into flaky tests, was amplified by
+  order-dependent set iteration in our own weld code, and finally required a
+  statistically sized test sample rather than a 30-edge coin flip. The native solver is
   bit-deterministic per seed by construction, which made every regression in
   it bisectable.
 - **L6. Ship small, keep an anchor.** Fifteen releases in nine days meant
@@ -255,8 +258,11 @@ instrument until the numbers explain it.
 
 ## 7. Results
 
-*(Numbers as of v0.4.6, the post-campaign release; full tables in
-`tests/bench_native.sh` output and the repository's release notes.)*
+*(Numbers as of v0.4.6; the overnight campaign of 2026-08-18 ran the full
+suite 10x across two Blender binaries and two code states, three benchmark
+repetitions, isolated-config zip installs, four end-to-end avatar/backend
+combinations with posed-rig verification, a 25-run leak soak, and
+determinism measurement.)*
 
 - Suite: **123/123**; pathological-input gauntlet 34/34 with the invariant
   *valid mesh or clean error, never a crash or hang*.
@@ -266,17 +272,29 @@ instrument until the numbers explain it.
   **~3°** vs QuadriFlow 7.1°. Density response: native reallocates budget
   (≈159% of ideal response) where QuadriFlow's post-hoc relaxation reaches 65%.
 - Rexouium end-to-end (29k faces, 116 shells, exact symmetry): ~99.7% quads,
-  watertight seam, all 640 shape keys / 150 groups / UVs preserved, posed
-  deformation error p95 0.06% of bbox diagonal, ~14–45 s depending on backend.
+  watertight seam (seam_open = 0 in every campaign run), all 640 shape keys /
+  150 groups / UVs preserved **exactly**, posed-deformation error p95
+  0.121–0.161% (max 0.7–2.7%) of the bbox diagonal across backends,
+  ~14–45 s depending on backend.
 - NX-Dinasty (46.8k hand-made): main-shell coverage 99%+, authored hair,
-  ruff, teeth and eyes byte-identical, exact mirror symmetry with zero open
+  ruff, teeth and eyes byte-identical (25 keys / 118 groups / UVs exact),
+  posed-deformation p95 0.074–0.161%, exact mirror symmetry with zero open
   seam edges attributable to the pipeline.
+- Resource envelope: 25 consecutive remeshes in one session leak nothing
+  (all datablock growth is reclaimable zero-user orphans; peak RSS 646 MB) —
+  a lesson bought expensively, since an earlier *unserialised* test campaign
+  exhausted the host's 60 GB of RAM and took the orchestrating session down
+  with it.
 
 What remains honestly unsolved: semantic loop placement (eyelid rings, mouth
 loops as an artist would draw them) — our curvature alignment follows forms
 but does not *plan* loops; thin-shell silhouettes remain resolution-bound;
 face-count adherence under strongly non-uniform density fields drifts
-(-15%..+1%); and Blender's QuadriFlow remains, at the deepest level, weather.
+(-15%..+1%); the off-default `preserve_small_shells=False` path is degraded (open seams,
+regressed unnoticed at v0.4.2/3 because nothing exercised it — every
+untested path rots); the native+symmetry combination leaves exactly one
+non-manifold edge on one test avatar; and Blender's QuadriFlow remains, at
+the deepest level, weather.
 
 ## 8. Conclusion
 
