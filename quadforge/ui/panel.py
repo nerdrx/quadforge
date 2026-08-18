@@ -107,9 +107,15 @@ class VIEW3D_PT_quadforge(bpy.types.Panel):
 
         col.separator()
         col.prop(s, "adaptive_size")
+        # Size Contrast bounds the input prior too, so it stays live when the
+        # prior is the only thing driving the sizing field
+        band = col.column()
+        band.active = s.adaptive_size > 0.0 or s.use_input_density
+        band.prop(s, "detail_range")
         sub = col.column()
         sub.active = s.adaptive_size > 0.0
         sub.prop(s, "adapt_quad_count")
+        col.prop(s, "use_input_density")
 
         col.separator()
         col.prop(s, "use_paint_density")

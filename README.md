@@ -19,7 +19,12 @@ preserved as authored; the body is solved with curvature-following quads:
 
 **Remeshing**
 - Target quad count / ratio / edge length, with optional **Strict Count** (iterates until within ~10%)
-- **Adaptive Size** — concentrate quads in curved areas
+- **Adaptive Size** — concentrate quads in curved areas, with **Size Contrast** (Native)
+  to widen the coarse:fine quad-size ratio up to 12× for vertex-starved budgets — big flat
+  areas go coarse, the face and hands keep their structure, and the size ramps rather than
+  steps (the field is gradient-limited)
+- **Detail from Input** (Native, opt-in) — where the input mesh has big triangles, the
+  artist already said "no detail here"; the output goes coarse there too
 - **Painted density** — paint where you want more/less resolution (`qf_density` attribute)
 - Backends: **QuadriFlow+** (Blender's built-in solver wrapped with QuadForge pre/post passes)
   and an experimental **Native** field-based solver (Instant-Meshes-style, pure numpy)

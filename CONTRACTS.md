@@ -39,6 +39,13 @@ tests/
 - mode: Enum ['FACES','RATIO','EDGE'] default FACES
 - target_ratio: Float default 1.0; target_edge_length: Float default 0.1
 - adaptive_size: Float 0..100 (%, curvature adaptivity; 0 = uniform)
+- detail_range: Float 3..12 default 3.0 (Native only; widest coarse:fine quad
+  edge-length ratio adaptivity may open up, reached at adaptive_size 100.
+  3.0 = pre-existing behaviour, bit-identical; above 3 the sizing field is
+  gradient-limited. Never set by any preset)
+- use_input_density: Bool default False (Native only; read the input mesh's own
+  tessellation as a detail hint — long input edges → coarser output. Bounded by
+  detail_range, measured before the solver's refinement. Never set by a preset)
 - adapt_quad_count: Bool (True = allow count drift for adaptivity)
 - strict_count: Bool (iterate solver up to 3x to land within 10% of target)
 - use_paint_density: Bool — read float point-attribute `qf_density` (0..2, 1=neutral)
@@ -88,7 +95,9 @@ def remesh(context, work_obj, s, face_target: int) -> None      # in-place; nump
 # native internals: solver.solve(V:(n,3)f64, F:(m,3)i32, params: dict) -> (VQ:(k,3), FQ_list)
 #   FQ_list: list of index tuples, each of length 3 or 4 (quad-dominant; >=70% quads expected)
 # params: {'target_faces', 'adaptive', 'sharp_edges': (e,2)i32, 'guide_dirs': per-face unit vec or None,
-#          'density': per-vertex float or None, 'symmetry': (bool,bool,bool), 'seed'}
+#          'density': per-vertex float or None, 'symmetry': (bool,bool,bool), 'seed',
+#          'detail_range': float (3.0 = legacy), 'use_input_density': bool,
+#          'input_prior': per-vertex float or None (solve() measures it itself when absent)}
 ```
 
 ## Analysis / guides contract (core/analysis.py, core/guides.py)

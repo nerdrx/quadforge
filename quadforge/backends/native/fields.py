@@ -17,7 +17,9 @@ v2 adds the *curvature-aligned* half of the story (see NATIVE_V2.md):
   natural flow of the surface (around eyes, along muscles, around a torus
   tube) instead of an arbitrary smooth field,
 * per-vertex target edge lengths (``rho``) from the face budget, the painted
-  density attribute and curvature adaptivity,
+  density attribute, curvature adaptivity over a requestable contrast band
+  (``detail_range``) and an optional input-tessellation prior, all relaxed to a
+  bounded spatial gradient and renormalised back onto the face budget,
 * the ``solve_fields(V, F, params) -> FieldSolution`` entry point.
 
 Everything is vectorised over *directed edges* and accumulated with
@@ -1054,24 +1056,147 @@ def alignment_weight(cur, curvature_align=0.7, lo=0.15, hi=0.45):
     return np.clip(w * cur.conf, 0.0, 1.0)
 
 
+# the coarse:fine edge-length ratio the curvature band could reach before
+# ``detail_range`` existed; keeping it as the default makes every pre-existing
+# solve bit-identical, and it is also the value below which the grading limiter
+# stays out of the way (see ``target_edge_lengths``)
+LEGACY_DETAIL_RANGE = 3.0
+# widest band the UI may ask for; past this the extractor spends more time
+# refining the input than solving
+MAX_DETAIL_RANGE = 12.0
+# |d rho / d x| the grading limiter enforces once a wider band is requested.
+# The bound is scale free: g = 0.3 means "rho may change by 30% of itself over
+# its own length", i.e. a quad's neighbour is at most ~1.3x its size.  Looser
+# bounds do not work: measured on the Dinasty body at a 3000-face request, the
+# fraction of the input surface the extractor manages to cover was
+#
+#     g       0.8    0.5    0.3    0.2
+#     B=4    0.52   0.61   0.65   0.77
+#     B=6    0.43   0.65   0.63   0.65
+#     B=8    0.34   0.54   0.78   0.71
+#
+# and anything under 0.6 is rejected by solve() as a collapsed extraction, so
+# 0.8 and 0.5 throw the whole adaptive solve away on that model.  0.3 is also
+# the value Persson (2006) uses for mesh-size gradient limiting.
+SIZE_GRADING = 0.3
+
+
+def limit_size_gradient(rho, V, edges, grading=SIZE_GRADING, iters=64):
+    """Bound the spatial gradient of a sizing field: ``|rho_i - rho_j| <=
+    grading * |x_i - x_j|`` over every edge.
+
+    A sizing field is only realisable if it varies slowly compared to itself.
+    Ask for quads of 1 unit next to quads of 8 and the extractor has to stitch
+    the two grids together inside a single cell: it does that with a fan of
+    irregular vertices, and the result reads as a hard seam across an otherwise
+    smooth surface.  The classic fix (Persson 2006) is to relax the field until
+    its gradient is bounded, which is a min-plus (shortest-path) problem:
+    ``rho_i <- min(rho_i, rho_j + g |x_i - x_j|)`` swept to a fixed point.
+
+    The relaxation only ever *lowers* ``rho``, i.e. it can only add faces.  The
+    caller re-runs :func:`budget_scale` afterwards, so the requested count is
+    unaffected - a limited field spends slightly more of its budget in the
+    transition rings and slightly less in the coarse interior.
+
+    Returns a copy; ``rho`` is not modified.
+    """
+    rho = np.array(rho, dtype=np.float64, copy=True)
+    g = float(grading)
+    if not np.isfinite(g) or g <= 0.0 or edges is None or len(edges) == 0:
+        return rho
+    e = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    i, j = e[:, 0], e[:, 1]
+    lim = g * np.linalg.norm(V[j] - V[i], axis=1)
+    for _ in range(int(iters)):
+        di = rho[i] - rho[j] - lim          # > 0 -> i is too coarse next to j
+        dj = rho[j] - rho[i] - lim
+        hi = di > 1e-12
+        lo = dj > 1e-12
+        if not (hi.any() or lo.any()):
+            break
+        upd = rho.copy()
+        if hi.any():
+            np.minimum.at(upd, i[hi], (rho[j] + lim)[hi])
+        if lo.any():
+            np.minimum.at(upd, j[lo], (rho[i] + lim)[lo])
+        rho = upd
+    return rho
+
+
+def input_detail_prior(V, F, n, edges=None, smooth=6):
+    """Per-vertex length scale of the *input* tessellation (mean incident edge
+    length), smoothed in the log domain.
+
+    Where an artist left long edges they have already declared "nothing
+    interesting happens here"; where they subdivided, they have declared the
+    opposite.  Curvature cannot see that difference - a decimated flat panel
+    and a smooth blob both read as ``kappa ~ 0`` - so it is a genuinely
+    independent signal, and it is the one the user's own request names ("big
+    faces don't need as many vertexes").
+
+    Smoothing is essential and has to happen in the log domain: the measure is
+    a *scale*, its noise is multiplicative, and at a triangulation boundary
+    (dense blob welded to a sparse panel) an arithmetic mean would hand the
+    seam vertices a value dominated by the long side.  Six Jacobi passes spread
+    the estimate about two rings, which is enough to kill per-vertex jitter
+    without smearing the blob/panel step itself.
+
+    Timing note: this must be measured on the tessellation the *user* authored.
+    ``solver.solve`` midpoint-subdivides a too-coarse input before the fields
+    run - that step is uniform, so it preserves every ratio in this measure -
+    but ``extract`` later runs a *selective* red-green refinement driven by the
+    local ``rho``, which would erase the signal completely.  The prior is
+    therefore captured in ``solve`` before any refinement and carried along.
+    """
+    if edges is None:
+        edges = build_edges(F)
+    e = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    L = np.linalg.norm(V[e[:, 1]] - V[e[:, 0]], axis=1)
+    s = (np.bincount(e[:, 0], weights=L, minlength=n)
+         + np.bincount(e[:, 1], weights=L, minlength=n))
+    c = (np.bincount(e[:, 0], minlength=n)
+         + np.bincount(e[:, 1], minlength=n)).astype(np.float64)
+    t = np.log(np.maximum(s / np.maximum(c, 1.0), EPS))
+    cnt = np.maximum(c, 1.0)
+    for _ in range(int(max(0, smooth))):
+        acc = (np.bincount(e[:, 0], weights=t[e[:, 1]], minlength=n)
+               + np.bincount(e[:, 1], weights=t[e[:, 0]], minlength=n))
+        t = 0.5 * t + 0.5 * (acc / cnt)
+    return np.exp(t)
+
+
 def target_edge_lengths(V, F, n, target_faces, density=None, adaptive=0.0,
-                        cur=None, areas=None):
+                        cur=None, areas=None, detail_range=LEGACY_DETAIL_RANGE,
+                        input_prior=None, grading="auto", edges=None):
     """Per-vertex target edge length ``rho``.
 
     * base: ``sqrt(area / target_faces)`` - a quad of side ``rho`` covers
       ``rho^2`` of surface (v1 behaviour, unchanged),
     * ``density`` (1 = neutral, >1 = denser) divides it, exactly as v1,
     * ``adaptive`` in ``[0, 1]`` additionally shrinks ``rho`` where the
-      surface curves - ``rho ~ kappa^(-adaptive/2)`` clamped to a 3x band,
+      surface curves - ``rho ~ kappa^(-adaptive/2)`` clamped to a
+      ``detail_range`` band, so at full adaptivity the flattest region may
+      carry quads ``detail_range`` times longer than the busiest one,
+    * ``input_prior`` (a per-vertex input length scale, see
+      :func:`input_detail_prior`) coarsens ``rho`` where the *input* mesh was
+      already coarse, bounded by the same band,
+    * the combined field is gradient-limited (:func:`limit_size_gradient`) so
+      the size can not step,
     * the field is renormalised so that its *predicted cell count*
-      ``sum(A_v / rho_v**2)`` is the requested one, so density and adaptivity
-      only *redistribute* the face budget.
+      ``sum(A_v / rho_v**2)`` is the requested one, so density, adaptivity and
+      the input prior only *redistribute* the face budget.
 
     Renormalising the *mean* of ``rho`` (what this did before) is not the same
     thing: the count is driven by ``1/rho**2``, which is convex, so spreading
     ``rho`` at a fixed mean silently buys extra faces (Jensen).  A uniform
     ``rho`` is a fixed point of both rules, so nothing changes for inputs
     without a density attribute or adaptivity.
+
+    ``grading`` is the gradient bound; ``"auto"`` (the default) enables it only
+    once something asks for more than the legacy 3x band - either
+    ``detail_range`` was raised or an ``input_prior`` is in play.  The legacy
+    band ships unlimited because that is what every existing result was
+    produced with, and re-grading it would silently change them.
     """
     if areas is None:
         _, areas = face_normals_areas(V, F)
@@ -1080,6 +1205,11 @@ def target_edge_lengths(V, F, n, target_faces, density=None, adaptive=0.0,
     rho0 = np.sqrt(max(area, EPS) / target)
     rho = np.full(n, rho0, dtype=np.float64)
 
+    band = float(detail_range)
+    if not np.isfinite(band):
+        band = LEGACY_DETAIL_RANGE
+    band = float(np.clip(band, 1.0, MAX_DETAIL_RANGE))
+
     if density is not None:
         d = np.asarray(density, dtype=np.float64).ravel()
         if d.size == n:
@@ -1087,13 +1217,37 @@ def target_edge_lengths(V, F, n, target_faces, density=None, adaptive=0.0,
             rho = rho0 / d
 
     a = float(np.clip(adaptive, 0.0, 1.0))
-    if a > 0.0 and cur is not None:
+    if a > 0.0 and cur is not None and band > 1.0:
         kk = np.maximum(np.abs(cur.k1), np.abs(cur.k2))
         kk = np.nan_to_num(kk, nan=0.0, posinf=0.0, neginf=0.0)
         ref = float(np.percentile(kk, 60.0))
         if ref > EPS:
-            fac = np.clip(kk / ref, 1.0 / 3.0, 3.0) ** (0.5 * a)
+            fac = np.clip(kk / ref, 1.0 / band, band) ** (0.5 * a)
             rho = rho / fac
+
+    # input tessellation prior: long input edges -> longer output quads.  The
+    # reference is the *median* input scale, so an evenly tessellated mesh is a
+    # fixed point (every ratio is 1) no matter how fine or coarse it is.
+    prior_used = False
+    if input_prior is not None and band > 1.0:
+        t = np.asarray(input_prior, dtype=np.float64).ravel()
+        if t.size == n:
+            t = np.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+            ref_t = float(np.median(t[t > EPS])) if np.any(t > EPS) else 0.0
+            if ref_t > EPS:
+                rho = rho * np.clip(np.maximum(t, EPS) / ref_t,
+                                    1.0 / band, band) ** 0.5
+                prior_used = True
+
+    g = grading
+    if g is None or (isinstance(g, str) and g == "auto"):
+        wide = (band > LEGACY_DETAIL_RANGE + 1e-9
+                or band < LEGACY_DETAIL_RANGE - 1e-9)
+        g = SIZE_GRADING if (wide or prior_used) else 0.0
+    if float(g) > 0.0:
+        if edges is None:
+            edges = build_edges(F)
+        rho = limit_size_gradient(rho, V, edges, grading=float(g))
 
     return rho * budget_scale(rho, vertex_areas(V, F, n, areas=areas), target)
 
@@ -1134,6 +1288,14 @@ FIELD_DEFAULTS = {
     "target_faces": 5000,
     "density": None,
     "adaptive": 0.0,
+    # widest coarse:fine quad-size ratio the curvature band (and the input
+    # prior) may reach at full adaptivity; 3.0 = pre-0.5.5 behaviour
+    "detail_range": LEGACY_DETAIL_RANGE,
+    # read the input mesh's own tessellation as a detail hint
+    "use_input_density": False,
+    "input_prior": None,          # precomputed prior (solver captures it
+                                  # before its refinement stage)
+    "size_grading": "auto",       # gradient bound on rho, see target_edge_lengths
     "sharp_edges": None,
     "guide_dirs": None,
     "curvature_align": 0.7,
@@ -1351,9 +1513,23 @@ def solve_fields(V, F, params=None):
     adaptive = float(p["adaptive"])
     if adaptive > 1.0:                 # Blender hands over 0..100
         adaptive /= 100.0
+    # The input-tessellation prior is measured on the mesh the user authored.
+    # ``solver.solve`` captures it before its (uniform, ratio-preserving)
+    # pre-subdivision and hands it over here; when solve_fields is driven
+    # directly the mesh in hand *is* the authored one, so it is measured now.
+    prior = None
+    if bool(p.get("use_input_density", False)):
+        prior = p.get("input_prior")
+        if prior is None or np.asarray(prior).size != n:
+            prior = input_detail_prior(V, F, n, edges=edges)
     rho = target_edge_lengths(V, F, n, p["target_faces"],
                               density=p.get("density"), adaptive=adaptive,
-                              cur=cur, areas=areas)
+                              cur=cur, areas=areas,
+                              detail_range=float(
+                                  p.get("detail_range") or LEGACY_DETAIL_RANGE),
+                              input_prior=prior,
+                              grading=p.get("size_grading", "auto"),
+                              edges=edges)
 
     # ---- opening rings ---------------------------------------------------
     # Curvature alignment has nothing useful to say about the collar around an

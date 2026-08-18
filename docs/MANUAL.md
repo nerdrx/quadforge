@@ -128,9 +128,9 @@ It **redistributes** the budget rather than adding to it. The two backends
 deliver it very differently, and this matters:
 
 - **Native** — real adaptivity. Target edge length shrinks with curvature
-  (`ρ ∝ κ^(-a/2)`, clamped to a 3× band) and the field is renormalised so the
-  predicted face count stays on target. Curved regions genuinely get more,
-  smaller quads.
+  (`ρ ∝ κ^(-a/2)`, clamped to the *Size Contrast* band, 3× by default) and the
+  field is renormalised so the predicted face count stays on target. Curved
+  regions genuinely get more, smaller quads.
 - **QuadriFlow+** — QuadriFlow takes no density input at all, so QuadForge
   applies adaptivity *afterwards* as a density-weighted relaxation: quad
   **size** varies, quad **count** and topology do not. Plus, if *Adapt Quad
@@ -140,6 +140,56 @@ deliver it very differently, and this matters:
 Values around 30–50 % are a good general setting; 60 %+ is for sculpts with
 strong detail/flat contrast. At 0 % the density attribute is uniform and both
 backends solve uniformly.
+
+#### Size Contrast — `detail_range` (default 3.0, Native only)
+How much coarser the flattest parts of the mesh are allowed to get than the
+busiest ones, as a ratio of **quad edge length** (so 6 means 6× the edge, 36×
+the area). It is the clamp on the curvature term above, and the full ratio is
+only reached at *Adaptive Size* 100 % — the achievable spread is
+`Size Contrast ^ (adaptive/100)`, so at 40 % adaptivity a setting of 6 buys
+about 2×, not 6×. Greyed out at *Adaptive Size* 0.
+
+Leave it at 3 and nothing changes: 3 is exactly what QuadForge did before this
+setting existed, down to the last bit. Raise it when the budget is too small to
+carry the whole surface at one quad size — a character at 3 000 faces, a prop
+that is mostly flat panel with one detailed fitting. On the Dinasty avatar at a
+3 000-face request the whole-mesh coarse:fine ratio went from 7.0× to 8.3× as
+this moved from 3 to 10, and the face that had collapsed into a handful of
+triangle fans came back with recognisable eye and muzzle loops.
+
+Above 3 the sizing field is also **gradient-limited**: quad size may change by
+at most ~30 % of itself per quad, so it ramps between the fine and coarse
+regions instead of stepping. That costs a little of the nominal contrast and
+buys a mesh the extractor can actually build — without it, the wide bands
+produce size seams, and on a heavily creased model they make the solve collapse
+outright. Feature and *Opening Rings* densification still win locally: they are
+applied on top of the graded field, so a hard edge crossing a coarse panel
+keeps its denser band, just measured against that panel's size.
+
+Values much past 8 buy little on an organic mesh — the curvature signal itself
+runs out — but they are there for hard-surface work where one small fitting
+sits on a large flat body.
+
+#### Detail from Input — `use_input_density` (default off, Native only)
+Reads the **input mesh's own tessellation** as a detail hint. Where the artist
+left long edges they have already said "nothing happens here", and curvature
+cannot see that: a decimated flat panel and a smooth blob both read as κ ≈ 0.
+With this on, each vertex's mean incident input edge length (smoothed in the
+log domain) multiplies into the sizing field, bounded by *Size Contrast*, so
+sparsely tessellated regions come out coarse and densely sculpted ones fine.
+
+It is a **no-op on evenly tessellated input** — the measure is taken relative
+to the mesh's own median, so a uniform mesh has ratio 1 everywhere — and it is
+measured before the solver's internal refinement, so the solver's own
+subdivision cannot wash it out.
+
+Turn it on for sculpts assembled from parts of very different densities
+(a ZBrush blob welded to a box-modelled panel, a scan glued to hand geometry),
+and for retopology of an already-good mesh whose density you want to keep. It
+does **not** help on production game meshes that are already evenly
+tessellated — on the Dinasty avatar it changed the quad distribution without
+improving it, because that mesh's density variation is not where the detail is.
+**Native backend only**, and no preset turns it on.
 
 #### Adapt Quad Count — `adapt_quad_count` (default on)
 Asks the solver for up to **10 % extra faces** (`1 + 0.10 × adaptive`) so the
@@ -656,6 +706,8 @@ Verified against `quadforge/properties.py` at v0.5.4.
 | `target_ratio` | 1.0 |
 | `target_edge_length` | 0.1 m |
 | `adaptive_size` | 0 % |
+| `detail_range` | 3.0 (3 … 12) |
+| `use_input_density` | off |
 | `adapt_quad_count` | on |
 | `strict_count` | off |
 | `use_paint_density` | off |

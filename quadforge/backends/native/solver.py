@@ -59,6 +59,10 @@ _MAX_VERTS = 1_000_000
 _DEFAULTS = {
     "target_faces": 5000,
     "adaptive": 0.0,
+    # widest coarse:fine quad-size ratio adaptivity may reach (fields.py)
+    "detail_range": _f.LEGACY_DETAIL_RANGE,
+    "use_input_density": False,
+    "input_prior": None,
     "sharp_edges": None,
     "guide_dirs": None,
     "density": None,
@@ -79,7 +83,7 @@ _DEFAULTS = {
 _PARAM_OVERRIDES: dict = {}
 
 
-def _subdivide(V, F, sharp, density, guides):
+def _subdivide(V, F, sharp, density, guides, prior=None):
     """One 1-to-4 midpoint subdivision (the piecewise-linear surface is
     unchanged, only the sampling density grows).  Constraint data is carried
     along."""
@@ -124,7 +128,30 @@ def _subdivide(V, F, sharp, density, guides):
     if guides is not None:
         guides2 = np.tile(np.asarray(guides, dtype=np.float64), (4, 1))
 
-    return V2, F2, sharp2, dens2, guides2
+    # The input-tessellation prior has to survive this stage: it describes the
+    # mesh the *user* authored, and subdividing it would report the solver's
+    # own sampling instead.  This split is uniform, so carrying the measured
+    # values along (midpoints get the edge average, in the log domain - the
+    # prior is a scale) reproduces exactly the field measured before it.
+    prior2 = None
+    if prior is not None:
+        pl = np.log(np.maximum(np.asarray(prior, dtype=np.float64), 1e-30))
+        prior2 = np.exp(np.concatenate(
+            [pl, 0.5 * (pl[e[:, 0]] + pl[e[:, 1]])]))
+
+    return V2, F2, sharp2, dens2, guides2, prior2
+
+
+def _wide_sizing(p) -> bool:
+    """True when the caller asked for more than the legacy 3x size band.
+
+    Everything the wide-contrast path adds is behind this switch, so a solve
+    that does not ask for it is bit-identical to the one before it existed.
+    """
+    band = p.get("detail_range")
+    band = _f.LEGACY_DETAIL_RANGE if band is None else float(band)
+    return (abs(band - _f.LEGACY_DETAIL_RANGE) > 1e-9
+            or bool(p.get("use_input_density", False)))
 
 
 def _guides_to_vertices(F, n, guide_dirs, N):
@@ -193,13 +220,29 @@ def solve(V, F, params=None):
         if len(guide_in) != len(F):
             guide_in = None
 
+    # Measured *before* the loop below: the input-tessellation prior is a
+    # statement about the mesh the user handed over.  Midpoint subdivision is
+    # uniform and therefore ratio-preserving, so measuring after it would give
+    # the same field - but ``extract`` runs a selective, rho-driven red-green
+    # refinement further down that is not, and keeping the capture here makes
+    # the ordering explicit rather than accidental.
+    prior_in = None
+    if bool(p.get("use_input_density", False)):
+        prior_in = p.get("input_prior")
+        if prior_in is not None:
+            prior_in = np.asarray(prior_in, dtype=np.float64).ravel()
+            if prior_in.size != n:
+                prior_in = None
+        if prior_in is None:
+            prior_in = _f.input_detail_prior(V, F, n)
+
     for _ in range(_MAX_SUBDIV):
         if V.shape[0] >= _MIN_SAMPLES_PER_QUAD * target:
             break
         if V.shape[0] > _MAX_VERTS // 4:
             break
-        V, F, sharp_in, dens_in, guide_in = _subdivide(
-            V, F, sharp_in, dens_in, guide_in)
+        V, F, sharp_in, dens_in, guide_in, prior_in = _subdivide(
+            V, F, sharp_in, dens_in, guide_in, prior_in)
     n = V.shape[0]
 
     # ---- v2 path: curvature-aligned fields + robust extraction ----------
@@ -212,6 +255,7 @@ def solve(V, F, params=None):
             p2["sharp_edges"] = sharp_in
             p2["density"] = dens_in
             p2["guide_dirs"] = guide_in
+            p2["input_prior"] = prior_in
             p2.setdefault("curvature_align", 0.7)
             sol = _f2.solve_fields(V, F, p2)
 
@@ -285,6 +329,25 @@ def solve(V, F, params=None):
                 wa = _f.vertex_areas(V, F, V.shape[0])
                 pre = float(np.sum(wa / np.maximum(rho2, 1e-12) ** 2))
                 sol.rho = boosted * _f.budget_scale(boosted, wa, pre)
+
+            # The sizing field was gradient-limited inside solve_fields, but the
+            # feature boost above (and the opening-ring boost inside it) run
+            # afterwards and put the steps straight back: a 2x change of rho
+            # over a decay length of 1.5 rings is a ~50%-per-quad gradient, well
+            # past what the extractor can stitch.  On the Dinasty body at a
+            # 3000-face request - 12k feature edges, so the boost covers most of
+            # the surface - the extraction covered 0.35 of the input area with a
+            # single limiting pass and 0.70 with this second one; anything under
+            # 0.6 is discarded as collapsed a few lines below, which threw the
+            # whole adaptive solve away.  Re-limit and re-normalise: the boost
+            # keeps its magnitude at the feature, it only ramps out over a few
+            # more quads.  Legacy solves never enter here (see _wide_sizing).
+            if _wide_sizing(p2):
+                wa = _f.vertex_areas(V, F, V.shape[0])
+                pre = float(np.sum(wa / np.maximum(sol.rho, 1e-12) ** 2))
+                lim = _f.limit_size_gradient(sol.rho, V, _f.build_edges(F))
+                sol.rho = lim * _f.budget_scale(lim, wa, pre)
+
             VQ, FQ = _e2.extract(V, F, sol, p2)
             # accept only a result that plausibly covers the input surface:
             # a collapsed extraction (fragments of the input) must fall back

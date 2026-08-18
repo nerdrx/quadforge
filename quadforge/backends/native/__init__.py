@@ -295,6 +295,8 @@ def remesh(context, work_obj, s, face_target):
         "seed": int(getattr(s, "seed", 0) or 0) if s else 0,
         "preserve_boundaries": bool(getattr(s, "preserve_boundaries", True)) if s else True,
         "use_opening_rings": bool(getattr(s, "use_opening_rings", False)) if s else False,
+        "detail_range": float(getattr(s, "detail_range", 3.0) or 3.0) if s else 3.0,
+        "use_input_density": bool(getattr(s, "use_input_density", False)) if s else False,
     }
 
     try:

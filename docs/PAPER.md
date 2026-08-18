@@ -2,7 +2,7 @@
 # Agentic Development and Adversarial Visual QA
 
 **nerdrx & Claude (Anthropic Fable 5, with parallel Opus 5 implementation agents)**
-*August 9–18, 2026 — 22 releases, ~13,000 lines, 162 automated checks*
+*August 9–18, 2026 — 22 releases, ~13,000 lines, 170 automated checks*
 
 ---
 
@@ -140,9 +140,62 @@ neighborhoods receive a graded density boost (plateau-then-decay falloff over
 graph distance; see §5 for how the amplitude of this boost produced the
 project's subtlest regression).
 
+**3.5 Sizing: how much contrast a field can carry, and where it comes from.**
+The sizing field ρ is the only channel through which "spend fewer vertices
+here" can be said, and two things about it turned out to be non-obvious.
+
+*The band is not the binding constraint; the gradient is.* Curvature
+adaptivity clamps κ/κ_ref to a band before raising it to `adaptive/2`, so the
+band is exactly the coarse:fine edge-length ratio reachable at full
+adaptivity. Widening it from the original 3 to 6–12 (`detail_range`) is a
+one-line change and does move the ratio — measured area-weighted (p90/p02, so
+the tails do not flatter it) on a bumpy-band sphere: 1.74× → 2.46× → 3.17× at
+bands 3, 6, 10. But the *achievable* field is bounded by realisability, not by
+the clamp: ρ must vary slowly compared to itself or the extractor has to
+stitch two grid resolutions inside one cell, which it does with a fan of
+irregular vertices that reads as a seam. So the combined field (paint ×
+curvature × prior) is relaxed to |∇ρ| ≤ 0.3 — Persson's mesh-size gradient
+limiting, a min-plus sweep `ρ_i ← min(ρ_i, ρ_j + g·|x_i − x_j|)` — and then
+re-normalised onto the same cell budget, since the relaxation only ever lowers
+ρ and therefore only ever adds faces.
+
+The bound had to be measured, not assumed. At g = 0.8 ("ρ may change 80% of
+itself per quad", the value that reads as smooth on a plot) the Dinasty body
+at a 3000-face request extracted 0.34–0.52 of its own surface area, which the
+solver rejects as a collapsed extraction and silently replaces with the
+non-adaptive v1 path; at g = 0.3 the same solves covered 0.65–0.78 and were
+accepted. Worse, the limit has to be applied **twice**: the feature-density
+boost (§3.4) runs *after* the field is built and multiplies ρ by up to 2 over
+a 1.5-ring decay, which is a ~50%-per-quad gradient put straight back into a
+field that was just graded. On a model with 13k feature edges that single
+omission was the difference between 0.35 and 0.85 coverage. Any post-hoc
+multiplier on ρ has to be followed by a re-grade; that is the general lesson.
+
+*A tessellation prior must be measured before the solver touches the mesh.*
+"Big input faces mean the artist wanted no detail there" is a genuinely
+independent signal — curvature cannot distinguish a decimated flat panel from
+a smooth blob, both read κ ≈ 0 — and it is cheap: mean incident input edge
+length per vertex, smoothed in the *log* domain (the quantity is a scale, its
+noise is multiplicative, and an arithmetic mean at a dense/sparse weld hands
+the seam vertices the long side's value). The trap is ordering. The native
+solver refines its input twice, and only one of the two is harmless: the
+pre-solve refinement is a *uniform* 1-to-4 midpoint split, which preserves
+every ratio in the measure, but the extractor's red–green pass (§3.2) is
+*selective and driven by ρ itself*, so measuring anywhere downstream of it
+returns the solver's own sampling — a perfectly smooth, perfectly circular,
+perfectly useless signal. The prior is therefore captured in `solve()` before
+any refinement and carried through the subdivision (log-domain edge averages
+at the new midpoints), and the test for it asserts that pre-refinement
+actually fired (7.8k → 31k vertices) before checking the prior survived it.
+
+Both features are gated behind "did the user ask for more than the legacy 3×
+band", so every pre-existing solve is bit-identical — verified by hashing
+`solve_fields`+`extract` and full `solver.solve` output against the previous
+commit on three fixtures including a captured real solve.
+
 ## 4. Verification apparatus
 
-- **162 assertion checks** across 17 headless test modules (registration,
+- **170 assertion checks** across 18 headless test modules (registration,
   remeshing accuracy, symmetry exactness, sharp preservation, data transfer,
   density/guides, reporting, native gates, LODs/batch, orientation/seam
   regressions, mirrored-weight regressions, a 34-case pathological-input
@@ -286,7 +339,7 @@ repetitions, isolated-config zip installs, four end-to-end avatar/backend
 combinations with posed-rig verification, a 25-run leak soak, and
 determinism measurement.)*
 
-- Suite: **123/123** then, **162/162** at v0.5.4; pathological-input gauntlet
+- Suite: **123/123** then, **170/170** today (162/162 at the v0.5.4 tag); pathological-input gauntlet
   34/34 with the invariant *valid mesh or clean error, never a crash or hang*.
 - Benchmark gates: native **5/6** fixtures pass everything (the 6th requires a
   watertight Suzanne; Blender's own Suzanne has 168 boundary edges).
@@ -492,7 +545,7 @@ Instant Meshes and standard mesh-repair practice — but because the
 fixtures, real rigged assets, quantitative gates on every merge, renders in
 front of a human who owned the ground truth, and implementation agents whose
 reports were trusted precisely because they were willing to say "I measured
-my idea and it is wrong." The complete system, its 162-check suite, its
+my idea and it is wrong." The complete system, its 170-check suite, its
 benchmark, and this history are free software:
 **github.com/nerdrx/quadforge**.
 

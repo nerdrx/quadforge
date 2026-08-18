@@ -227,6 +227,31 @@ class QF_Settings(bpy.types.PropertyGroup):
                     "the count does not",
         default=0.0, min=0.0, max=100.0, subtype='PERCENTAGE',
     )
+    detail_range: FloatProperty(
+        name="Size Contrast",
+        description="Native backend: the widest quad-size ratio adaptivity may "
+                    "open up — 6 means the flattest regions may carry quads "
+                    "with six times the edge length of the busiest ones (36x "
+                    "the area). Reached at Adaptive Size 100%; lower adaptivity "
+                    "scales the spread back. 3 is the classic band; raise it "
+                    "when the face budget is too small to carry the whole "
+                    "surface at one size. Above 3 the sizing field is also "
+                    "gradient-limited so quad size ramps instead of stepping. "
+                    "No effect on QuadriFlow+, which takes no density input",
+        default=3.0, min=3.0, max=12.0, precision=1,
+    )
+    use_input_density: BoolProperty(
+        name="Detail from Input",
+        description="Native backend: treat the input mesh's own tessellation as "
+                    "a detail hint — where the artist left big triangles, go "
+                    "coarse there too, even where curvature is ambiguous "
+                    "(a decimated flat panel and a smooth blob both read as "
+                    "zero curvature). Bounded by Size Contrast, and a no-op on "
+                    "evenly tessellated input. Measured before the solver's own "
+                    "refinement, so it survives it. No effect on QuadriFlow+, "
+                    "which takes no density input",
+        default=False,
+    )
     adapt_quad_count: BoolProperty(
         name="Adapt Quad Count",
         description="Ask the solver for up to 10% extra faces so the QuadriFlow+ "
