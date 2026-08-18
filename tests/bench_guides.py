@@ -582,7 +582,10 @@ def run_case(pipeline, fx, backend, use_guides, render=True, seed=0):
     rep = res.get("report") or {}
     row["backend_used"] = rep.get("backend", backend)
     row["guide_edges"] = rep.get("guide_edges")
-    if row["backend_used"] != backend:
+    # guided QuadriFlow solves are deliberately routed to the native solver
+    # (QuadriFlow has no constraint channel); show that, don't fail on it
+    row["rerouted"] = bool(rep.get("guides_rerouted"))
+    if row["backend_used"] != backend and not row["rerouted"]:
         row["error"] = "fell back to %s" % row["backend_used"]
 
     me = out.data
@@ -628,8 +631,9 @@ def print_table(rows):
             cells.append("%5s %5s %5s" % (b.get("n", 0),
                                           _f(b.get("guide_med")),
                                           _f(b.get("nat_med"))))
+        label = "QF>NATIVE" if r.get("rerouted") else r["backend"]
         _p("%-12s %-11s %-8s %6d %6.1f %5s | %-18s | %-18s | %-18s"
-           % (r["fixture"], r["backend"], r["variant"], r["faces"],
+           % (r["fixture"], label, r["variant"], r["faces"],
               r["quad_pct"], _f(r.get("floor_deg")),
               cells[0], cells[1], cells[2]))
 

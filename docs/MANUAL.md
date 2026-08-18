@@ -209,11 +209,13 @@ curve at the 3D cursor in a *QuadForge Guides* collection, ticks *Use Guides*,
 and drops you into Edit Mode with the Draw tool active — draw the stroke, then
 Tab back to Object Mode.
 
-Backend difference: **Native** reads the projected direction field
+Guides need the Native solver: it reads the projected direction field
 (`qf_guide`, per-face) and steers the whole orientation field with it.
-**QuadriFlow+** only sees the projected path marked as a hard edge — the flow
-tends to follow it, but it is not directional steering. If guides matter, use
-the Native backend.
+Blender's QuadriFlow operator has no constraint channel at all (measured:
+bit-identical output with and without guide marks), so when guides land on
+the surface a **QuadriFlow+** solve automatically switches to the Native
+backend for that run — the report says so in `warnings` and
+`backend: NATIVE`.
 
 ### Symmetry
 
@@ -542,7 +544,7 @@ Feature matrix:
 | Adaptive Size | post-pass (size varies, count does not) | in-solver, real reallocation |
 | Adapt Quad Count edge-loop removal | yes | no |
 | Painted density | post-pass relaxation | in-solver |
-| Guides | path marked hard only | full directional steering |
+| Guides | auto-switches the solve to Native | full directional steering |
 | Deterministic per seed | no | yes |
 | Hang-Safe Solver applies | yes | n/a (cannot hang this way) |
 

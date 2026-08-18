@@ -797,9 +797,10 @@ def preprocess(context, work_obj, s, report: dict) -> None:
     # Flag-based flow features are a Native-backend capability: measured
     # (identical output hashes) Blender's QuadriFlow derives features from
     # dihedral angle only and ignores sharp FLAGS on flat geometry.
-    if getattr(s, "backend", "QUADRIFLOW") == "QUADRIFLOW":
+    # Guides are not listed here: run_remesh reroutes guided QuadriFlow
+    # solves to the native backend right after this preprocess.
+    if report.get("backend", "QUADRIFLOW") == "QUADRIFLOW":
         flag_features = [name for flag, name in (
-            (getattr(s, "use_guides", False), "guides"),
             (getattr(s, "use_materials", False), "material boundaries"),
             (getattr(s, "use_uv_seams", False), "UV island boundaries"),
         ) if flag]
@@ -1187,6 +1188,32 @@ def run_remesh(context, obj, s) -> dict:
         report["mode"] = getattr(s, "mode", "FACES")
 
         preprocess(context, work, s, report)
+
+        # Guided solves can't run on QuadriFlow: the operator hands the solver
+        # bare vertex/triangle arrays, so the projected sharp paths never reach
+        # it (measured: bit-identical output with/without marks). Reroute to
+        # the native field solver, which consumes both the sharp paths and the
+        # qf_guide attribute. Only when guides actually landed on the surface -
+        # a junk or empty guide collection shouldn't change the solver.
+        if (backend_name == "QUADRIFLOW" and getattr(s, "use_guides", False)
+                and int(report.get("guide_edges") or 0) > 0):
+            native_mod = None
+            try:
+                from .backends import native as native_mod
+            except Exception:
+                native_mod = None
+            if native_mod is not None and hasattr(native_mod, "remesh"):
+                backend, backend_name = native_mod, "NATIVE"
+                report["backend"] = "NATIVE"
+                report["guides_rerouted"] = True
+                report["warnings"].append(
+                    "guides cannot steer QuadriFlow - this solve was routed "
+                    "to the Native backend")
+            else:
+                report["warnings"].append(
+                    "guides have no effect on QuadriFlow and the Native "
+                    "backend is unavailable - remeshing without guide "
+                    "influence")
 
         # reference for post-remesh orientation repair (pre-bisect, full mesh)
         ref_mesh = work.data.copy()

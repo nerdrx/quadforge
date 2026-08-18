@@ -286,9 +286,9 @@ class QF_Settings(bpy.types.PropertyGroup):
     use_guides: BoolProperty(
         name="Use Guides",
         description="Project curve / Grease Pencil objects from the guide "
-                    "collection onto the surface. Native steers the whole "
-                    "orientation field along them; QuadriFlow+ only gets the "
-                    "projected path as a hard edge",
+                    "collection onto the surface and steer the orientation "
+                    "field along them. Guides need the Native solver, so "
+                    "guided QuadriFlow+ solves switch to it automatically",
         default=False,
     )
     use_opening_rings: BoolProperty(

@@ -3,9 +3,16 @@
 Curve / Grease Pencil objects are sampled into polylines, projected onto the
 working mesh and turned into
 
-* sharp edge paths (QuadriFlow aligns its cross field to sharp edges), and
+* sharp edge paths, and
 * a per-face float-vector attribute ``qf_guide`` holding the desired flow
   direction, consumed by the native backend.
+
+Only the native backend consumes either of these. Blender's QuadriFlow
+operator hands the solver bare vertex/triangle arrays - ``use_preserve_sharp``
+merely enables QuadriFlow's internal dihedral-angle crease detection, so
+flag-marked sharp edges on smooth geometry never reach it (measured:
+bit-identical output with/without marks). ``pipeline.run_remesh`` therefore
+reroutes guided QuadriFlow solves to the native backend.
 """
 
 from __future__ import annotations
