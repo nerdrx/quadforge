@@ -35,6 +35,55 @@ def _mean_edge_len(obj, upper):
     return (total / n) if n else None, n
 
 
+# a direction 30 degrees off the grid axes: far from the axis-aligned 4-RoSy
+# class of a staircase, so the two are easy to tell apart
+_GUIDE_DIR = (0.8660254037844387, 0.5, 0.0)
+
+
+def _flat_grid(n, size=1.0):
+    """(V, F) of an n x n triangulated flat grid in the z = 0 plane."""
+    import numpy as np
+    g = np.linspace(-size, size, n)
+    X, Y = np.meshgrid(g, g, indexing="ij")
+    V = np.stack([X.ravel(), Y.ravel(), np.zeros(X.size)], axis=1)
+    F = []
+    for i in range(n - 1):
+        for j in range(n - 1):
+            a = i * n + j
+            F.append((a, a + n, a + n + 1))
+            F.append((a, a + n + 1, a + 1))
+    return V, np.asarray(F, dtype=np.int64)
+
+
+def _staircase_guide_grid(n):
+    """Flat grid + a ~30 degree guide stored the way project_guides stores one.
+
+    Returns ``(V, F, sharp, guide_faces, chain)``: the walked path as sharp
+    *axis-aligned* mesh edges (what the surface walk produces), the smooth
+    curve direction as a per-face vector attribute, and the path vertices.
+    """
+    import numpy as np
+    V, F = _flat_grid(n)
+    i, j = 3, 3
+    chain = [i * n + j]
+    for k in range(2 * (n - 8)):
+        if k % 3 == 2:                      # 2 steps in x per step in y ~ 27 deg
+            j += 1
+        else:
+            i += 1
+        if i >= n - 3 or j >= n - 3:
+            break
+        chain.append(i * n + j)
+    chain = np.asarray(chain, dtype=np.int64)
+    sharp = np.stack([chain[:-1], chain[1:]], axis=1)
+    on_path = np.zeros(len(V), dtype=bool)
+    on_path[chain] = True
+    touch = on_path[F].any(axis=1)
+    guide_faces = np.zeros((len(F), 3))
+    guide_faces[touch] = _GUIDE_DIR
+    return V, F, sharp, guide_faces, chain
+
+
 def _guide_count(res):
     """Find a 'how many guide edges did we use' number in the result."""
     stats = (res.get("stats") or {}) if isinstance(res, dict) else {}
@@ -182,6 +231,58 @@ def run(ctx):
         else:
             c.note("no 'qf_guide' face attribute written")
         c.note("edges=%d" % n)
+
+    # --------------------------------------------- guides vs their sharp path
+    # project_guides marks the path it walks sharp (that is the only channel
+    # QuadriFlow understands), so in the native backend every guided vertex is
+    # also a sharp vertex.  The staircase of mesh edges the walk took must not
+    # be allowed to speak for the curve: an axis-aligned staircase is
+    # 4-RoSy-consistent with the grid it steps over, so letting it win pins the
+    # flow to exactly what the guide was drawn to override.
+    with r.case("guide_outranks_its_own_sharp_path") as c:
+        import numpy as np
+        fields = ctx.imp("quadforge.backends.native.fields")
+        V, F = _flat_grid(9)
+        N = fields.vertex_normals(V, F)
+        n = len(V)
+        mid = n // 2
+        sharp = np.array([[mid, mid + 1]], dtype=np.int64)   # runs along +x
+        gdir = np.zeros((n, 3))
+        gdir[mid] = _GUIDE_DIR
+        m_win, d_win = fields.build_constraints(V, N, n, sharp, gdir,
+                                                guides_win=True)
+        m_old, d_old = fields.build_constraints(V, N, n, sharp, gdir,
+                                                guides_win=False)
+        c.require(bool(m_win[mid]) and bool(m_old[mid]),
+                  "the guided vertex lost its constraint entirely")
+        a_win = float(fields.rosy4_angle(d_win[mid:mid + 1],
+                                         np.array([_GUIDE_DIR]))[0])
+        a_old = float(fields.rosy4_angle(d_old[mid:mid + 1],
+                                         np.array([_GUIDE_DIR]))[0])
+        c.require(np.degrees(a_win) < 1.0,
+                  "guides_win=True still pins the sharp direction "
+                  "(%.1f deg off the guide)" % np.degrees(a_win))
+        c.require(np.degrees(a_old) > 10.0,
+                  "guides_win=False no longer reproduces the old behaviour "
+                  "(%.1f deg)" % np.degrees(a_old))
+        c.note("guide %.1f deg vs sharp-path %.1f deg off the curve"
+               % (np.degrees(a_win), np.degrees(a_old)))
+
+    with r.case("guide_steers_the_orientation_field") as c:
+        import numpy as np
+        fields = ctx.imp("quadforge.backends.native.fields")
+        V, F, sharp, gfaces, chain = _staircase_guide_grid(21)
+        sol = fields.solve_fields(V, F, {
+            "target_faces": 400, "sharp_edges": sharp, "guide_dirs": gfaces,
+            "curvature_align": 0.0, "seed": 0,
+        })
+        tgt = np.tile(_GUIDE_DIR, (len(chain), 1))
+        ang = np.degrees(fields.rosy4_angle(sol.Q[chain], tgt))
+        med = float(np.median(ang))
+        c.require(med < 5.0,
+                  "the field on the guide sits %.1f deg off it - the staircase "
+                  "of sharp edges is speaking for the curve again" % med)
+        c.note("median %.2f deg over %d guided verts" % (med, len(chain)))
 
     with r.case("material_boundaries_to_sharp") as c:
         ctx.fresh_scene()

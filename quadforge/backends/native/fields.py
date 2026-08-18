@@ -148,15 +148,54 @@ def vertex_normals(V, F):
     return normalize(N)
 
 
+# above this vertex count the packed edge key would overflow int64
+_KEY_MAX = 3_037_000_499
+
+
+def unique_edge_rows(a, b, n, counts=False):
+    """Sorted unique undirected edges ``(min, max)`` of the pairs ``(a, b)``.
+
+    Same output as ``np.unique(np.sort(np.stack([a, b], 1), 1), axis=0)``: the
+    packed key ``lo * n + hi`` is strictly monotone in the lexicographic row
+    order.  The row-wise ``np.unique`` sorts a void-dtype view and is several
+    times slower - it was one of the largest single numpy costs in the solve.
+    """
+    a = np.asarray(a, dtype=np.int64)
+    b = np.asarray(b, dtype=np.int64)
+    lo = np.minimum(a, b)
+    hi = np.maximum(a, b)
+    m = np.int64(max(int(n), 1))
+    if m > _KEY_MAX:                                    # pragma: no cover
+        e = np.stack([lo, hi], axis=1)
+        if counts:
+            return np.unique(e, axis=0, return_counts=True)
+        return np.unique(e, axis=0), None
+    if counts:
+        key, cnt = np.unique(lo * m + hi, return_counts=True)
+    else:
+        key, cnt = np.unique(lo * m + hi), None
+    out = np.empty((len(key), 2), dtype=np.int64)
+    np.floor_divide(key, m, out=out[:, 0])
+    np.subtract(key, out[:, 0] * m, out=out[:, 1])
+    return out, cnt
+
+
+def _tri_edge_pairs(F):
+    """The three edges of every triangle, as two flat index arrays."""
+    F = np.asarray(F, dtype=np.int64)
+    a = np.concatenate([F[:, 0], F[:, 1], F[:, 2]])
+    b = np.concatenate([F[:, 1], F[:, 2], F[:, 0]])
+    return a, b
+
+
 def build_edges(F):
     """Unique undirected edges of a triangle soup, as (E, 2) int64, i<j."""
-    e = np.concatenate(
-        [F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], axis=0
-    ).astype(np.int64)
-    e = np.sort(e, axis=1)
-    e = np.unique(e, axis=0)
-    e = e[e[:, 0] != e[:, 1]]
-    return e
+    F = np.asarray(F, dtype=np.int64)
+    if F.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    a, b = _tri_edge_pairs(F)
+    e, _ = unique_edge_rows(a, b, int(F.max()) + 1)
+    return e[e[:, 0] != e[:, 1]]
 
 
 def build_csr(edges, n):
@@ -179,11 +218,11 @@ def build_csr(edges, n):
 
 def boundary_edges(F):
     """Edges incident to exactly one triangle."""
-    e = np.concatenate(
-        [F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], axis=0
-    ).astype(np.int64)
-    e = np.sort(e, axis=1)
-    uniq, counts = np.unique(e, axis=0, return_counts=True)
+    F = np.asarray(F, dtype=np.int64)
+    if F.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    a, b = _tri_edge_pairs(F)
+    uniq, counts = unique_edge_rows(a, b, int(F.max()) + 1, counts=True)
     return uniq[counts == 1]
 
 
@@ -209,7 +248,8 @@ def random_tangents(N, rng):
 # constraints (sharp edges + guide directions)
 # --------------------------------------------------------------------------
 
-def build_constraints(V, N, n, sharp_edges=None, guide_vert_dirs=None):
+def build_constraints(V, N, n, sharp_edges=None, guide_vert_dirs=None,
+                      guides_win=True):
     """Build per-vertex hard orientation constraints.
 
     ``sharp_edges``      (k, 2) int  - crease / boundary / guide-path edges.
@@ -218,12 +258,35 @@ def build_constraints(V, N, n, sharp_edges=None, guide_vert_dirs=None):
     Directions are projected into the tangent plane.  A vertex touched by
     several sharp edges gets the 4-RoSy average of them (perpendicular
     creases are compatible in a 4-RoSy field, so a box corner resolves
-    cleanly).  Sharp edges win over guides.
+    cleanly).
+
+    ``guides_win`` decides who owns a vertex that has *both*.  It defaults to
+    the guide, and that is not a preference, it is the only defensible
+    reading of the data: ``core.guides.project_guides`` marks the walked path
+    sharp (QuadriFlow only understands sharp edges), so a guided vertex is
+    always a sharp vertex, and the sharp direction there is the *staircase of
+    mesh edges* the walk happened to take, not the curve.  Worse, a staircase
+    is 4-RoSy-*consistent* with the grid it staircases over - alternating
+    meridian / parallel steps are the same 4-RoSy class - so the crease
+    direction reads as "align to the existing grid", which is exactly what
+    the guide was drawn to override.  Measured against the true curve
+    tangent at the overridden vertices (55-66% of all guided vertices on the
+    tests/bench_guides.py fixtures):
+
+        fixture       sharp path   qf_guide attribute
+        sphere_gc       22.1 deg          2.9 deg
+        grid_scurve     31.7 deg         13.9 deg
+        cyl_helix       39.2 deg         11.1 deg   (39.2 ~ the natural flow)
+
+    Sharp edges still own every vertex the guides do not touch, and the
+    *position* pin (``pin_mask`` in the callers) is still built from sharp
+    edges alone, so creases keep their lattice line either way.
 
     Returns ``(mask (n,) bool, dirs (n, 3) float)``.
     """
     mask = np.zeros(n, dtype=bool)
     dirs = np.zeros((n, 3), dtype=np.float64)
+    gmask = np.zeros(n, dtype=bool)
 
     if guide_vert_dirs is not None:
         g = np.asarray(guide_vert_dirs, dtype=np.float64).reshape(n, 3)
@@ -236,6 +299,7 @@ def build_constraints(V, N, n, sharp_edges=None, guide_vert_dirs=None):
             sel = np.nonzero(gm)[0][ok]
             dirs[sel] = gp[ok] / gpl[ok][:, None]
             mask[sel] = True
+            gmask[sel] = True
 
     if sharp_edges is not None and len(sharp_edges):
         se = np.asarray(sharp_edges, dtype=np.int64).reshape(-1, 2)
@@ -276,10 +340,12 @@ def build_constraints(V, N, n, sharp_edges=None, guide_vert_dirs=None):
                 acc[:, c] = np.bincount(vi, weights=rep[:, c], minlength=n)
             acc = acc - N * _dot(acc, N)[:, None]
             al = np.sqrt(np.einsum("ij,ij->i", acc, acc))
-            good = refm & (al > 1e-7)
+            # a guided vertex keeps the curve's own tangent (see the docstring)
+            write = refm & ~gmask if guides_win else refm
+            good = write & (al > 1e-7)
             dirs[good] = acc[good] / al[good][:, None]
             # degenerate accumulation -> keep the raw reference
-            fallback = refm & ~good
+            fallback = write & ~good
             dirs[fallback] = ref[fallback]
             mask[refm] = True
 
@@ -402,8 +468,7 @@ def build_hierarchy(P, N, indptr, indices, rho, con_mask, con_dir, rng,
         pi, pj = pi[keep], pj[keep]
         if len(pi) == 0:
             break
-        ce = np.sort(np.stack([pi, pj], axis=1), axis=1)
-        ce = np.unique(ce, axis=0)
+        ce, _ = unique_edge_rows(pi, pj, nc)
         cip, cidx, csrc = build_csr(ce, nc)
 
         # constraints propagate upward: lowest-index constrained child wins
@@ -949,6 +1014,27 @@ def smooth_cross_field(D, W, N, src, dst, iters=3):
     return D
 
 
+def _graph_distance(seed_mask, edges, n, max_rings):
+    """Edge-hop distance from ``seed_mask``; ``inf`` beyond ``max_rings``."""
+    d = np.full(n, np.inf)
+    if not seed_mask.any() or not len(edges):
+        return d
+    d[seed_mask] = 0.0
+    cur = np.asarray(seed_mask, dtype=bool).copy()
+    for k in range(1, int(max_rings) + 1):
+        m = cur[edges[:, 0]] | cur[edges[:, 1]]
+        if not m.any():
+            break
+        nxt = np.zeros(n, dtype=bool)
+        nxt[edges[m].ravel()] = True
+        newly = nxt & ~np.isfinite(d)
+        if not newly.any():
+            break
+        d[newly] = float(k)
+        cur = newly
+    return d
+
+
 def alignment_weight(cur, curvature_align=0.7, lo=0.15, hi=0.45):
     """Per-vertex soft-alignment weight ``curvature_align * smoothstep(a)``.
 
@@ -1023,6 +1109,7 @@ class FieldSolution:
     con_mask: np.ndarray = None      # (n,)  hard-constrained vertices
     con_dir: np.ndarray = None       # (n,3)
     pin_mask: np.ndarray = None      # (n,)  position-pinned subset (creases)
+    guide_mask: np.ndarray = None    # (n,)  vertices carrying a guide direction
     bnd_verts: np.ndarray = None     # (n,)  boundary vertices
     edges: np.ndarray = None         # (e,2) undirected edge list
     levels: list = _dc_field(default=None, repr=False)
@@ -1036,6 +1123,10 @@ FIELD_DEFAULTS = {
     "sharp_edges": None,
     "guide_dirs": None,
     "curvature_align": 0.7,
+    # a guide outranks the sharp path project_guides derived from it, and that
+    # path is not treated as a crease (see build_constraints)
+    "guides_win": True,
+    "guide_falloff": 4.0,         # curvature-pull relaxation radius, in quads
     "seed": 0,
     "orient_iters": 20,
     "curvature_smooth": "auto",   # int, or "auto" = derive from rho
@@ -1075,11 +1166,28 @@ def _guide_dirs_to_vertices(guide_dirs, n, nf, F, N):
             return None
         gu = g[live] / ln[live][:, None]
         fi = np.nonzero(live)[0]
+        # 4-RoSy-aware accumulation.  Summing the raw face vectors (what this
+        # did) is only correct while every face around a vertex happens to
+        # agree on a *sign*: two strokes that cross at a right angle, or one
+        # stroke that doubles back, cancel to zero and the vertex silently
+        # loses its guide.  In a 4-RoSy field those contributions are the same
+        # class, so fold each one onto a per-vertex reference first - exactly
+        # what build_constraints already does for sharp edges.
+        vi = np.concatenate([F[fi, 0], F[fi, 1], F[fi, 2]])
+        vd = np.tile(gu, (3, 1))
+        nv = N[vi]
+        vd = vd - nv * _dot(vd, nv)[:, None]
+        vl = np.sqrt(np.einsum("ij,ij->i", vd, vd))
+        keep = vl > 1e-7
+        vi, vd, nv = vi[keep], vd[keep] / vl[keep][:, None], nv[keep]
+        if not len(vi):
+            return None
+        ref = np.zeros((n, 3))             # last write wins -> deterministic
+        ref[vi] = vd
+        rep = rosy4_representative(vd, nv, ref[vi])
         gd = np.zeros((n, 3))
-        for k in range(3):
-            vi = F[fi, k]
-            for c in range(3):
-                gd[:, c] += np.bincount(vi, weights=gu[:, c], minlength=n)
+        for c in range(3):
+            gd[:, c] = np.bincount(vi, weights=rep[:, c], minlength=n)
         return gd
     if len(g) == n:
         return g
@@ -1172,15 +1280,49 @@ def solve_fields(V, F, params=None):
             sharp_list.append(be)
     sharp_all = np.concatenate(sharp_list, axis=0) if sharp_list else None
 
+    guides_win = bool(p.get("guides_win", True))
     gverts = _guide_dirs_to_vertices(p.get("guide_dirs"), n, len(F), F, N)
-    con_mask, con_dir = build_constraints(V, N, n, sharp_all, gverts)
+    con_mask, con_dir = build_constraints(V, N, n, sharp_all, gverts,
+                                          guides_win=guides_win)
+    guide_mask = np.zeros(n, dtype=bool)
+    if gverts is not None:
+        guide_mask, _gdir = build_constraints(V, N, n, None, gverts)
     if sharp_all is not None and len(sharp_all):
         pin_mask, _ = build_constraints(V, N, n, sharp_all, None)
         pin_mask &= con_mask
     else:
         pin_mask = np.zeros(n, dtype=bool)
+    if guides_win and guide_mask.any():
+        # A guide is not a crease, so it must not pin the lattice either: the
+        # sharp path is a staircase of mesh edges, and while the orientation
+        # field can average a staircase back into the curve, a *position* pin
+        # drags the lattice onto the zigzag and the extracted edges inherit
+        # it.  (The extractor builds its own pins from the sharp list; see
+        # solver.solve, which keeps guide-only edges out of the list it hands
+        # over.)
+        pin_mask = pin_mask & ~guide_mask
     # a hard constraint overrides the soft curvature pull entirely
     align_w = np.where(con_mask, 0.0, align_w)
+
+    # ...and around a guide it is turned down rather than switched off, so the
+    # guide's influence decays into the curvature flow instead of stopping at
+    # a cliff one ring out.  Without this the neighbour of a guided vertex is
+    # already back at full curvature weight, which on a cylinder (principal
+    # directions 45 degrees away from a helical guide - the worst case a
+    # 4-RoSy field has) overrules the guide immediately and leaves a one-quad
+    # scar instead of a redirected flow.  Only the *weight* is relaxed: the
+    # direction the field takes over there is still the one the 4-RoSy
+    # smoothing propagates out of the guide, which is a better answer than any
+    # direction that could be extrapolated here.
+    gfall = float(p.get("guide_falloff", 0.0) or 0.0)
+    if guides_win and guide_mask.any() and gfall > 0.0:
+        rings = gfall * rho0 / max(mean_edge, EPS)   # in output quads -> rings
+        d = _graph_distance(guide_mask, edges, n,
+                            int(min(max(1, int(np.ceil(3.0 * rings))), 64)))
+        near = np.isfinite(d)
+        relax = np.ones(n)
+        relax[near] = 1.0 - np.exp(-d[near] / max(rings, EPS))
+        align_w = align_w * relax
 
     # ---- target edge length ---------------------------------------------
     adaptive = float(p["adaptive"])
@@ -1247,5 +1389,6 @@ def solve_fields(V, F, params=None):
         aniso=cur.aniso, align_w=align_w, align_dir=align_dir,
         k1=cur.k1, k2=cur.k2,
         con_mask=con_mask, con_dir=con_dir, pin_mask=pin_mask,
+        guide_mask=guide_mask,
         bnd_verts=bnd_verts, edges=edges, levels=levels, stats=stats,
     )

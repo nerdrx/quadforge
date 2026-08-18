@@ -124,23 +124,16 @@ def _subdivide(V, F, sharp, density, guides):
 
 
 def _guides_to_vertices(F, n, guide_dirs, N):
-    """Per-face guide vectors -> per-vertex tangent constraint directions."""
+    """Per-face guide vectors -> per-vertex tangent constraint directions.
+
+    Thin wrapper over the v2 implementation so that the fallback path gets the
+    same 4-RoSy-aware accumulation (summing the raw face vectors cancels
+    perpendicular or doubled-back strokes to zero).
+    """
     g = np.asarray(guide_dirs, dtype=np.float64).reshape(-1, 3)
     if len(g) != len(F):
         return None
-    ln = np.sqrt(np.einsum("ij,ij->i", g, g))
-    live = ln > 1e-9
-    if not live.any():
-        return None
-    gd = np.zeros((n, 3))
-    gu = g[live] / ln[live][:, None]
-    fi = np.nonzero(live)[0]
-    for k in range(3):
-        vi = F[fi, k]
-        # 4-RoSy-agnostic accumulation: align to the first contribution
-        for c in range(3):
-            gd[:, c] += np.bincount(vi, weights=gu[:, c], minlength=n)
-    return gd
+    return _f._guide_dirs_to_vertices(g, n, len(F), F, N)
 
 
 def solve(V, F, params=None):
@@ -217,10 +210,32 @@ def solve(V, F, params=None):
             p2["guide_dirs"] = guide_in
             p2.setdefault("curvature_align", 0.7)
             sol = _f2.solve_fields(V, F, p2)
+
+            # A guide is not a crease.  ``core.guides.project_guides`` marks
+            # the path it walks sharp because sharp edges are the only channel
+            # QuadriFlow understands, but downstream of the orientation solve
+            # that same list makes the extractor treat the guide as a hard
+            # feature: it pins the lattice onto the walked staircase, snaps
+            # samples to it and boosts the density around it.  The orientation
+            # field is the guide's proper channel and it already carries the
+            # curve's own tangent, so edges that live entirely inside the
+            # guided region are dropped from the feature list here.  Real
+            # creases keep every edge that has at least one endpoint off a
+            # guide, so a crease a guide merely crosses survives intact.
+            sharp_feat = sharp_in
+            gm = getattr(sol, "guide_mask", None)
+            gw_on = bool(p2.get("guides_win",
+                                _f2.FIELD_DEFAULTS.get("guides_win", True)))
+            if (gm is not None and sharp_feat is not None and len(sharp_feat)
+                    and np.any(gm) and gw_on):
+                keep = ~(gm[sharp_feat[:, 0]] & gm[sharp_feat[:, 1]])
+                sharp_feat = sharp_feat[keep]
+                p2["sharp_edges"] = sharp_feat if len(sharp_feat) else None
+
             # feature-density boost: thin rims and creases need denser quads
             # than flat regions or their silhouettes alias into jagged steps
             fb = float(p2.get("feature_density", 2.0))
-            if fb > 1.0 and sharp_in is not None and len(sharp_in):
+            if fb > 1.0 and sharp_feat is not None and len(sharp_feat):
                 # Graph-distance falloff, not a binary 2-ring dilation.  A hard
                 # 2.5x step in rho makes the extractor stitch a dense rim to a
                 # coarse interior across one ring, and that seam shows up as a
@@ -234,7 +249,7 @@ def solve(V, F, params=None):
                 nvv = V.shape[0]
                 ed_all = _f.build_edges(F)
                 d = np.full(nvv, np.inf)
-                seed = np.unique(sharp_in)
+                seed = np.unique(sharp_feat)
                 d[seed] = 0.0
                 cur = np.zeros(nvv, dtype=bool)
                 cur[seed] = True
