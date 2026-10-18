@@ -374,15 +374,32 @@ def _fuse_stray_tris(mesh) -> int:
     return left
 
 
-def _open_edges(mesh) -> int:
-    """Edges carrying exactly one face. 0 means the mesh is watertight."""
+def _boundary_loops(mesh) -> int:
+    """Number of connected boundary components (union-find over the vertices of
+    edges carrying exactly one face). 0 means the mesh is watertight."""
     if mesh is None or len(mesh.polygons) == 0:
         return 0
     bm = bmesh.new()
     bm.from_mesh(mesh)
-    n = sum(1 for e in bm.edges if len(e.link_faces) == 1)
+    parent = {}
+
+    def find(x):
+        while parent[x] is not x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for e in bm.edges:
+        if len(e.link_faces) != 1:
+            continue
+        for v in e.verts:
+            parent.setdefault(v, v)
+        ra, rb = find(e.verts[0]), find(e.verts[1])
+        if ra is not rb:
+            parent[rb] = ra
+    loops = len({find(v) for v in parent})
     bm.free()
-    return n
+    return loops
 
 
 def _run_worker_round(part_objs, per_part_kwargs, timeout: float):
@@ -457,19 +474,30 @@ def _run_worker_round(part_objs, per_part_kwargs, timeout: float):
                     continue
                 old = part.data
                 keep_name = old.name
-                # A shell far below QuadriFlow's useful resolution (a 24-face
-                # hair card, a tooth, a button) is sometimes returned TORN:
-                # the operator reports success but the quad mesh it hands back
-                # has holes the input did not have. Joined into the result that
-                # reads as an open seam, and the exact-symmetry mirror cannot
-                # close it because the tear is nowhere near the plane. Watertight
-                # in must stay watertight out; anything else is treated exactly
-                # like a refusal, so the existing escalation (jittered retry ->
-                # native rescue -> keep the original topology) handles it.
-                was_closed = _open_edges(old) == 0
+                # QuadriFlow sometimes returns a part TORN: the operator
+                # reports success but the quad mesh it hands back has holes the
+                # input did not have. Two shapes of the same defect:
+                #
+                # * a shell far below its useful resolution (a 24-face hair
+                #   card, a tooth, a button) comes back with open edges despite
+                #   watertight input;
+                # * a part that legitimately has a boundary — the bisected half
+                #   the exact-symmetry path solves — comes back with an EXTRA
+                #   boundary loop away from the cut (seen nondeterministically
+                #   with many solver threads). The mirror then duplicates that
+                #   hole on both sides, out of reach of the seam weld and the
+                #   seam_open_edges count.
+                #
+                # The invariant covering both: the solver must never create new
+                # boundary loops (for closed input, 0 loops in -> 0 loops out).
+                # The cut ring may be resampled, but it stays one loop. A torn
+                # part is treated exactly like a refusal, so the existing
+                # escalation (jittered retry -> native rescue -> keep the
+                # original topology) handles it.
+                old_loops = _boundary_loops(old)
                 part.data = new_mesh
                 _fuse_stray_tris(new_mesh)
-                if was_closed and _open_edges(new_mesh) > 0:
+                if _boundary_loops(new_mesh) > old_loops:
                     part.data = old
                     try:
                         bpy.data.meshes.remove(new_mesh)
